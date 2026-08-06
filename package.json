@@ -9,11 +9,13 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "build:shared": "tsc -p packages/shared/tsconfig.json && tsc -p packages/ai-grounding/tsconfig.json",
+    "vercel-build": "npm run build:shared && npm run build"
   },
   "dependencies": {
-    "@astroapp/ai-grounding": "workspace:*",
-    "@astroapp/shared": "workspace:*",
+    "@astroapp/ai-grounding": "file:./packages/ai-grounding",
+    "@astroapp/shared": "file:./packages/shared",
     "@fastify/cors": "^11.2.0",
     "@supabase/supabase-js": "^2.47.10",
     "fastify": "^5.2.0",
@@ -29,7 +31,7 @@
     "@types/node": "^22.10.2",
     "@types/pdfkit": "^0.13.9",
     "tsx": "^4.19.2",
-    "typescript": "^5.7.2",
+    "typescript": "^5.7.3",
     "vitest": "^4.1.9"
   }
 }

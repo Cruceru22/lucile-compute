@@ -13,6 +13,12 @@
 > workspace dependency. Nothing else is omitted or modified. The mobile client
 > is a separate, independently-licensed work that only consumes this service's
 > JSON over the network — see "License" below.
+>
+> Four test files are omitted here for the same reason: `gatingAudit*` and
+> `securityAudit` assert against the mobile app's source (that every premium
+> feature is gated on its screen, that no secret is referenced from client
+> code). They audit the app, not this service, and cannot run without it. Every
+> test that exercises this service's own behaviour is present and passing.
 
 Swiss Ephemeris calculation microservice (Node + TypeScript + Fastify 5).
 
