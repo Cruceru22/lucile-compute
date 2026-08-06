@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "build:shared": "tsc -p packages/shared/tsconfig.json && tsc -p packages/ai-grounding/tsconfig.json",
-    "vercel-build": "npm run build:shared && npm run build"
+    "vercel-build": "npm run fetch:ephemeris && npm run build:shared && npm run build",
+    "fetch:ephemeris": "node scripts/fetch-ephemeris.mjs"
   },
   "dependencies": {
     "@astroapp/ai-grounding": "file:./packages/ai-grounding",
