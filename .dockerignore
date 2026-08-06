@@ -1,0 +1,12 @@
+node_modules
+dist
+*.tsbuildinfo
+.env
+.env.*
+*.log
+.DS_Store
+test
+vitest.config.ts
+
+# NOTE: ephe/ is deliberately NOT ignored — the Dockerfile copies it when
+# present so the image ships the Swiss data files. See scripts/fetch-ephemeris.sh.

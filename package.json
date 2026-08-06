@@ -1,0 +1,35 @@
+{
+  "name": "@astroapp/compute",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@astroapp/ai-grounding": "workspace:*",
+    "@astroapp/shared": "workspace:*",
+    "@fastify/cors": "^11.2.0",
+    "@supabase/supabase-js": "^2.47.10",
+    "fastify": "^5.2.0",
+    "geo-tz": "^8.1.7",
+    "google-auth-library": "^10.9.0",
+    "luxon": "^3.7.2",
+    "pdfkit": "^0.15.1",
+    "sweph": "2.10.3-5",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/luxon": "^3.7.1",
+    "@types/node": "^22.10.2",
+    "@types/pdfkit": "^0.13.9",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.9"
+  }
+}
