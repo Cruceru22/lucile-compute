@@ -128,25 +128,15 @@ async function generateAnnualReport(
     ? directed.months.map((m) => `${m.label}: ${m.list}`).join('\n')
     : '';
 
-  const prompt = [
-    'Write a detailed, month-by-month annual forecast. Output EXACTLY in the format below,',
-    'using these literal `===Heading===` markers and writing NOTHING before the first marker.',
-    '',
-    `===${ANNUAL_OVERVIEW_HEADING}===`,
-    "2-3 paragraphs on the year's main themes: name the most significant transits, roughly when",
-    'they peak, and tie them to the natal placements.' +
-      (directed.available
-        ? ' Also name the 1-2 most important DIRECTED-PROFECTION activations of the year and the months they land in.'
-        : ''),
-    '',
-    ...months.map((m) => {
-      const directedLine = directedByLabel.get(m.label);
-      const directedClause = directedLine
-        ? ` Then give the PRECISE timing from directed profections for ${m.label}: ${directedLine === 'no directed-profection activation this month' ? 'no directed activation lands this month, so say the month is quiet by that measure.' : `state the exact date(s) and the tight day-window for each activation, and interpret what that natal factor or term-lord activating means.`}`
-        : '';
-      return `===${m.label}===\n1-2 concrete paragraphs for ${m.label}: NAME that month's exact transit(s) and their dates, connect them to the natal chart, and give specific guidance.${directedClause} If the month is quiet on every measure, say so honestly and point to the nearest upcoming activation. END the section with exactly ONE actionable, mundane suggestion for the month, something the reader can literally schedule or do (book the conversation, block the rest day, draft the budget, send the application), explicitly tied to the named transit that motivates it, citing that transit in parentheses.`;
-    }),
-    '',
+  // Shared ground truth, identical for all thirteen calls below.
+  //
+  // It goes in the SYSTEM prompt, NOT the user message, and that placement is
+  // the whole cost story. `AnthropicProvider.systemBlocks` marks the system
+  // block `cache_control: ephemeral`, so this large, unchanging block is billed
+  // once and then at ~0.1x for the twelve calls that follow. In a user message
+  // it would sit after the cache breakpoint and be billed in full thirteen
+  // times — turning a latency fix into a bill.
+  const groundTruth = [
     'THE EXACT TRANSITS (real, computed, use these, name them with their dates; never invent others):',
     transitBlock,
     ...(directed.available
@@ -155,21 +145,40 @@ async function generateAnnualReport(
           'DIRECTED PROFECTIONS (al-Tabari), the precise day-level timing. These are REAL,',
           'computed activations of the directed point (it moves one sign per profection year',
           'from the equal-house cusp). Use these EXACT dates and windows; never invent dates,',
-          'degrees, or aspects. When a month has an activation, lead its timing with this:',
+          'degrees, or aspects.',
           directedBlock,
         ]
       : []),
     '',
-    'Ground every factual claim in the chart facts above. Be specific to each month; never generic.',
+    'Ground every factual claim in the chart facts above. Be specific; never generic.',
   ].join('\n');
 
-  const result = await provider.chat({
-    system,
-    messages: [{ role: 'user', content: prompt }],
-    maxTokens: 8192,
-  });
-  const truncated = result.stopReason === 'max_tokens';
-  const raw = extractText(result.content);
+  const overviewPrompt = [
+    `Write the "${ANNUAL_OVERVIEW_HEADING}" section of an annual forecast: 2-3 paragraphs on the`,
+    "year's main themes. Name the most significant transits, roughly when they peak, and tie them",
+    'to the natal placements.' +
+      (directed.available
+        ? ' Also name the 1-2 most important DIRECTED-PROFECTION activations of the year and the months they land in.'
+        : ''),
+    'Write the prose only — no heading, no markers.',
+  ].join('\n');
+
+  function monthPrompt(label: string): string {
+    const directedLine = directedByLabel.get(label);
+    const directedClause = directedLine
+      ? ` Then give the PRECISE timing from directed profections for ${label}: ${directedLine === 'no directed-profection activation this month' ? 'no directed activation lands this month, so say the month is quiet by that measure.' : 'state the exact date(s) and the tight day-window for each activation, and interpret what that natal factor or term-lord activating means.'}`
+      : '';
+    return [
+      `Write the ${label} section of an annual forecast: 1-2 concrete paragraphs.`,
+      `NAME that month's exact transit(s) and their dates, connect them to the natal chart, and`,
+      `give specific guidance.${directedClause} If the month is quiet on every measure, say so`,
+      // Kept on ONE line: `promptGuards.test.ts` asserts this exact phrase is
+      // present in the source, so line-wrapping it silently disarms the guard.
+      'honestly and point to the nearest upcoming activation. END with exactly ONE actionable, mundane suggestion the reader can literally schedule or do (book the conversation, block the rest day, draft the budget, send the application), explicitly tied to the named transit that motivates it, citing that transit in parentheses.',
+      'Write the prose only — no heading, no markers.',
+    ].join('\n');
+  }
+
   // The annual forecast is ABOUT transiting planets ("transiting Jupiter in Aries
   // this month"), whose signs are the TRANSIT data's ground truth, NOT the natal
   // placements. Running natal placement-sign validation here false-flags every
@@ -177,43 +186,77 @@ async function generateAnnualReport(
   // we skip placement/house/aspect/retrograde validation for this text path and
   // treat the transit lines we fed the model as the ground truth instead.
   const validation: ValidationResult = { claims: [], violations: [], ok: true };
-  const repaired = softenTone(repairText(raw, validation));
+
+  const annualSystem = `${system}\n\n${groundTruth}`;
+
+  async function generateOne(prompt: string): Promise<string> {
+    const result = await provider.chat({
+      system: annualSystem,
+      messages: [{ role: 'user', content: prompt }],
+      // 1500 is ample for one section and, unlike the old single 8192-token call
+      // covering all thirteen, cannot truncate the year part-way through.
+      maxTokens: 1500,
+    });
+    const text = softenTone(repairText(extractText(result.content), validation)).trim();
+    if (text.length === 0) {
+      throw new Error(
+        result.stopReason === 'max_tokens'
+          ? 'section truncated before producing content (max_tokens)'
+          : 'section came back empty',
+      );
+    }
+    return text;
+  }
+
+  // ONE CALL PER SECTION, replacing a single 8192-token call that wrote all
+  // thirteen. Three reasons, in order of importance:
+  //
+  //  1. Wall-clock. Thirteen sections from one call is a long serial generation
+  //     that regularly ran past a minute; as independent calls the cost is the
+  //     SLOWEST one, not the sum. That is what brings a report inside a
+  //     serverless request budget.
+  //  2. It cannot truncate mid-year. The old call shared one token budget across
+  //     the whole forecast, so a long January quietly cost December.
+  //  3. Each month gets the model's full attention and its own budget.
+  //
+  // The overview is awaited FIRST, alone, on purpose: it warms the provider's
+  // cached system prefix, so the twelve month calls that follow bill it at ~0.1x
+  // instead of all paying full price simultaneously. Firing all thirteen at once
+  // would be marginally faster and materially more expensive.
+  const overviewText = await generateOne(overviewPrompt).catch((err: unknown) => {
+    console.warn('[reportInterpreter] annual overview failed:', err);
+    return null;
+  });
+
+  const monthResults = await Promise.allSettled(
+    months.map((m) => generateOne(monthPrompt(m.label))),
+  );
+
+  const sections: ReportSection[] = [];
+  if (overviewText) {
+    sections.push({ heading: ANNUAL_OVERVIEW_HEADING, body: overviewText, validation });
+  }
+  monthResults.forEach((outcome, index) => {
+    const label = months[index]?.label;
+    if (!label) return;
+    if (outcome.status === 'fulfilled') {
+      sections.push({ heading: label, body: outcome.value, validation });
+    } else {
+      console.warn(`[reportInterpreter] annual month "${label}" failed:`, outcome.reason);
+    }
+  });
+
+  // Everything failed — a blank PDF rendered as success would hide a total
+  // failure, so surface it as one.
+  if (sections.length === 0) {
+    throw new Error('Annual forecast came back empty (the AI returned no content).');
+  }
 
   const year = DateTime.fromISO(nowIso, { zone: 'utc' }).year;
 
-  // Empty / safety-blocked output: the model produced nothing usable. Rendering
-  // this as a blank "success" hides a total failure — throw so the caller (and
-  // the client's failure handling) treats it as such rather than a blank PDF.
-  if (repaired.trim().length === 0) {
-    throw new Error(
-      truncated
-        ? 'Annual forecast was truncated before any content was produced (max_tokens).'
-        : 'Annual forecast came back empty (the AI returned no content).',
-    );
-  }
-
-  // Split the single response on the `===Heading===` markers.
-  // String.split with a capturing group yields [pre, h1, body1, h2, body2, ...].
-  const parts = repaired.split(/^===\s*(.+?)\s*===\s*$/m);
-  const sections: ReportSection[] = [];
-  for (let i = 1; i < parts.length; i += 2) {
-    const heading = (parts[i] ?? '').trim();
-    const body = (parts[i + 1] ?? '').trim();
-    if (heading && body) sections.push({ heading, body, validation });
-  }
-  // Fallback: if the model ignored the markers, keep the whole text as one section
-  // so the user still gets a report rather than an empty PDF.
-  if (sections.length === 0) {
-    sections.push({ heading: ANNUAL_OVERVIEW_HEADING, body: repaired, validation });
-  }
-
-  // We expect 13 sections (overview + 12 months). If FEWER are produced — for ANY
-  // reason, not only a max_tokens truncation (the model can also just emit fewer
-  // ===markers===, or collapse into the single-blob fallback) — the missing
-  // months are failures. Count them unconditionally so the client never claims
-  // "all facts verified" / a complete year on a short report. A complete report
-  // (13 sections) yields 0; the marker-less single-blob fallback yields 1 section
-  // → EXPECTED-1 failures, correctly flagging it as incomplete.
+  // We expect 13 sections (overview + 12 months). Anything fewer means months
+  // are genuinely missing, so the client never claims a complete year on a short
+  // report.
   const EXPECTED_SECTIONS = months.length + 1;
   const failedSections = Math.max(0, EXPECTED_SECTIONS - sections.length);
 
@@ -976,13 +1019,22 @@ export async function generateReport(
   const system = systemPrompt(charts, kind, labels);
 
   const plan = SECTION_PLANS[kind];
-  const sections: ReportSection[] = [];
-  let hallucinationsCaught = 0;
-  let failures = 0;
-  let lastFailureMessage = '';
 
-  for (const item of plan) {
-    try {
+  // PARALLEL, not sequential.
+  //
+  // Each section is an independent generation: same charts, same system prompt,
+  // different section prompt — nothing downstream of one feeds the next. Awaiting
+  // them one at a time simply added up their latencies, so a four-section natal
+  // report took four model round-trips end to end and routinely ran past a
+  // minute. Run together, wall-clock is the SLOWEST single call rather than the
+  // sum, at identical cost (the same calls, the same tokens).
+  //
+  // `allSettled` + index order is what keeps the existing semantics intact: the
+  // report's sections must stay in plan order regardless of completion order,
+  // and one section failing must still degrade to a placeholder rather than
+  // rejecting the whole report.
+  const settled = await Promise.allSettled(
+    plan.map(async (item) => {
       const { text, validation } = await generateSection(
         provider,
         charts,
@@ -992,30 +1044,47 @@ export async function generateReport(
         item.prompt,
       );
       // An empty body (model returned nothing usable — e.g. a safety block or a
-      // max_tokens cut with no text) is a failed section, not a silent blank one.
-      // Treat it exactly like a thrown failure so `failedSections > 0` drives the
-      // client's "not all facts verified" warning.
+      // max_tokens cut with no text) is a failed section, not a silent blank
+      // one. Treat it exactly like a thrown failure so `failedSections > 0`
+      // drives the client's "not all facts verified" warning.
       if (text.trim().length === 0) {
         throw new Error('section produced no content');
       }
-      hallucinationsCaught += validation.violations.length;
-      sections.push({ heading: item.heading, body: text, validation });
-    } catch (err) {
-      // A single section failing (e.g. a transient Gemini 503 spike that survived
-      // the provider's retry+fallback) shouldn't sink the whole report. Emit a
-      // graceful placeholder and keep going; only fail if EVERY section fails.
-      // Log the cause (don't swallow it silently) and remember it so the
-      // all-sections-failed throw can surface WHY rather than a generic message.
-      failures++;
-      lastFailureMessage = err instanceof Error ? err.message : String(err);
-      console.warn(`[reportInterpreter] section "${item.heading}" failed:`, lastFailureMessage);
+      return { text, validation };
+    }),
+  );
+
+  const sections: ReportSection[] = [];
+  let hallucinationsCaught = 0;
+  let failures = 0;
+  let lastFailureMessage = '';
+
+  settled.forEach((outcome, index) => {
+    const item = plan[index];
+    if (!item) return;
+    if (outcome.status === 'fulfilled') {
+      hallucinationsCaught += outcome.value.validation.violations.length;
       sections.push({
         heading: item.heading,
-        body: 'This section could not be generated right now, the astrology engine was briefly busy. Open the report again in a little while to regenerate it.',
-        validation: { claims: [], violations: [], ok: true },
+        body: outcome.value.text,
+        validation: outcome.value.validation,
       });
+      return;
     }
-  }
+    // A single section failing (e.g. a transient provider 503 that survived the
+    // retry+fallback) shouldn't sink the whole report. Emit a graceful
+    // placeholder and keep the rest; only fail if EVERY section failed. Log the
+    // cause so the all-sections-failed throw can surface WHY.
+    failures++;
+    const reason: unknown = outcome.reason;
+    lastFailureMessage = reason instanceof Error ? reason.message : String(reason);
+    console.warn(`[reportInterpreter] section "${item.heading}" failed:`, lastFailureMessage);
+    sections.push({
+      heading: item.heading,
+      body: 'This section could not be generated right now, the astrology engine was briefly busy. Open the report again in a little while to regenerate it.',
+      validation: { claims: [], violations: [], ok: true },
+    });
+  });
 
   if (failures === plan.length) {
     throw new Error(

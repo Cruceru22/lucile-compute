@@ -59,7 +59,7 @@ export interface AIProvider {
 export const ANTHROPIC_TIER_MODELS = {
   interpretation: 'claude-haiku-4-5',
   chat: 'claude-sonnet-5',
-  report: 'claude-opus-4-8',
+  report: 'claude-opus-5',
 } as const;
 
 export type AnthropicTier = keyof typeof ANTHROPIC_TIER_MODELS;
