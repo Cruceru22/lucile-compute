@@ -1051,6 +1051,9 @@ export function buildApp() {
           : (conversationId ?? null);
       return {
         text: result.text,
+        // Tells the client the reply stopped mid-thought, so it can say so
+        // instead of presenting a half-sentence as a finished answer.
+        truncated: result.truncated,
         toolRounds: result.toolRounds,
         hallucinationsCaught: result.hallucinationsCaught,
         validated: result.validated,

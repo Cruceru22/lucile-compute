@@ -602,6 +602,16 @@ export function systemPrompt(charts: NatalChart[], kind: ReportKind, labels: str
 
 const MAX_TOOL_ROUNDS = 6;
 
+/**
+ * Token budget for one conversational turn.
+ *
+ * Must cover the model's THINKING as well as its reply: the chat tier is Sonnet
+ * with `thinking: adaptive`, and extended thinking spends this same budget. The
+ * previous 1024 was sized as if it were reply-only, so a turn that thought hard
+ * either ran out mid-sentence or produced no text whatsoever.
+ */
+const CHAT_MAX_TOKENS = 4096;
+
 function extractText(content: ContentBlock[]): string {
   return content
     .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
@@ -709,6 +719,14 @@ export interface InterpretationResult {
   toolRounds: number;
   hallucinationsCaught: number;
   validated: boolean;
+  /**
+   * The model hit its token ceiling, so `text` stops mid-thought.
+   *
+   * Surfaced rather than swallowed: a reply that ends mid-sentence looks like
+   * the astrologer trailing off, and the reader has no way to tell a deliberate
+   * ending from a truncated one. The client can say so and offer a retry.
+   */
+  truncated: boolean;
 }
 
 /** Natural-language phrase for a saved person's relationship type. */
@@ -888,9 +906,20 @@ export async function interpretChat(
   let finalContent: ContentBlock[] = [];
   let toolRounds = 0;
 
+  let truncated = false;
+
   for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-    const result = await provider.chat({ system, messages, tools: toolSpecs, maxTokens: 1024 });
+    const result = await provider.chat({
+      system,
+      messages,
+      tools: toolSpecs,
+      maxTokens: CHAT_MAX_TOKENS,
+    });
     finalContent = result.content;
+    // `max_tokens` is NOT a clean finish. Remember it so an answer that stopped
+    // mid-sentence — or produced no text at all — is reported rather than
+    // returned as if the model had finished speaking.
+    if (result.stopReason === 'max_tokens') truncated = true;
     if (result.stopReason !== 'tool_use') break;
     toolRounds++;
     messages.push({ role: 'assistant', content: result.content });
@@ -920,6 +949,27 @@ export async function interpretChat(
   }
 
   const raw = extractText(finalContent);
+
+  // An empty answer is a FAILURE, never a successful turn.
+  //
+  // The chat model runs with adaptive thinking, and thinking tokens are drawn
+  // from the SAME `max_tokens` budget as the reply. A hard question could spend
+  // the whole budget reasoning and return `stop_reason: max_tokens` carrying
+  // thinking blocks and no text block at all — `extractText` filters to text,
+  // found none, and the user got an empty bubble. Worse, it failed most often
+  // on exactly the questions worth asking, because those are the ones the model
+  // thinks hardest about.
+  //
+  // Throwing lets the route surface a retryable error instead of persisting an
+  // empty assistant turn (which also corrupts the alternation for later turns).
+  if (raw.trim().length === 0) {
+    throw new Error(
+      truncated
+        ? 'The answer ran out of room before any text was produced. Please ask again.'
+        : 'The astrologer returned an empty answer. Please ask again.',
+    );
+  }
+
   const validation = validateText(raw, chart);
   return {
     // `softenTone` is the DETERMINISTIC half of the D7 tone guard; the prompt
@@ -928,6 +978,7 @@ export async function interpretChat(
     // shipped unguarded — and the tone tests assert against that Edge copy, so
     // the suite stayed green.
     text: softenTone(repairText(raw, validation)),
+    truncated,
     toolRounds,
     hallucinationsCaught: validation.violations.length,
     validated: validation.violations.length === 0,
