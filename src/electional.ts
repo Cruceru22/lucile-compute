@@ -71,12 +71,39 @@ export interface DayFactors {
   rahuKalam: { start: string; end: string } | null;
 }
 
+/**
+ * One reason a day scored the way it did, as a CODE the client localizes.
+ *
+ * These used to be English sentences built on the server and rendered verbatim
+ * to all six locales — a German user read German chrome wrapped around
+ * "Mercury is retrograde, tradition cautions against contracts". The server
+ * states the fact; the client owns the words.
+ */
+export type ReasonCode =
+  | 'phaseWaxingFavoured'
+  | 'phaseWaningFavoured'
+  | 'phaseMismatch'
+  | 'dayRulerFavoured'
+  | 'mercuryRetrograde'
+  | 'voidOfCourse';
+
+export interface VerdictReason {
+  code: ReasonCode;
+  /** Interpolation values (planet/weekday/phase names) for the client's string. */
+  params?: Record<string, string>;
+}
+
 export interface ActivityVerdict {
   activity: Activity;
   label: string;
   score: number; // 0..100
   tier: Tier;
+  /**
+   * English prose, kept for non-UI consumers (reports, the AI grounding
+   * context). The MOBILE UI must render `reasonCodes` instead.
+   */
   reasons: string[];
+  reasonCodes: VerdictReason[];
 }
 
 export interface ElectionalDay {
@@ -224,6 +251,7 @@ function dayFactors(date: string, lat: number, lon: number, tzIana: string): Day
 function scoreActivity(rule: ActivityRule, f: DayFactors): ActivityVerdict {
   let score = 50;
   const reasons: string[] = [];
+  const reasonCodes: VerdictReason[] = [];
 
   if (rule.favorPhase) {
     if (f.moonPhase === rule.favorPhase) {
@@ -233,11 +261,18 @@ function scoreActivity(rule: ActivityRule, f: DayFactors): ActivityVerdict {
           ? `Waxing Moon, tradition favours growth and beginnings.`
           : `Waning Moon, tradition favours cutting back and slower regrowth.`,
       );
+      reasonCodes.push({
+        code: rule.favorPhase === 'waxing' ? 'phaseWaxingFavoured' : 'phaseWaningFavoured',
+      });
     } else {
       score -= 8;
       reasons.push(
         `The Moon is ${f.moonPhase}, not ${rule.favorPhase}, less ideal for this by tradition.`,
       );
+      reasonCodes.push({
+        code: 'phaseMismatch',
+        params: { actual: f.moonPhase, wanted: rule.favorPhase },
+      });
     }
   }
 
@@ -246,22 +281,37 @@ function scoreActivity(rule: ActivityRule, f: DayFactors): ActivityVerdict {
     reasons.push(
       `${weekdayName(f.weekday)} is ruled by ${f.dayRuler}, traditionally good for this.`,
     );
+    reasonCodes.push({
+      code: 'dayRulerFavoured',
+      params: { weekday: String(f.weekday), ruler: f.dayRuler },
+    });
   }
 
   // Hard "avoid" conditions cap the day's score.
+  // The two cautions are NOT equally strong, and the caps say so.
+  //
+  // Void-of-course is a narrow, precisely-defined traditional rule with a
+  // computable window, so it caps into `avoid` (< 40). Mercury retrograde is
+  // widely repeated but far thinner — it is a weeks-long background condition,
+  // not an instant — so on its own it caps into `mixed` (40–64) instead. It
+  // used to cap at 28, which painted three weeks in four of the year solid red
+  // and contradicted Today, where the same fact is a footnote that merely
+  // withholds the all-clear. One sky, one verdict.
   const mercuryRx = f.retrograde.includes('Mercury');
   if (rule.avoidMercuryRx && mercuryRx) {
-    score = Math.min(score, 28);
+    score = Math.min(score, 52);
     reasons.push(`Mercury is retrograde, tradition cautions against contracts, comms and travel.`);
+    reasonCodes.push({ code: 'mercuryRetrograde' });
   }
   if (rule.avoidVoc && f.voidOfCourse) {
     score = Math.min(score, 30);
     reasons.push(`The Moon is void-of-course midday, tradition says don't begin important things.`);
+    reasonCodes.push({ code: 'voidOfCourse' });
   }
 
   score = Math.max(0, Math.min(100, score));
   const tier: Tier = score >= 65 ? 'favorable' : score >= 40 ? 'mixed' : 'avoid';
-  return { activity: rule.id, label: rule.label, score, tier, reasons };
+  return { activity: rule.id, label: rule.label, score, tier, reasons, reasonCodes };
 }
 
 const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];

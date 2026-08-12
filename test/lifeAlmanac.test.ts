@@ -13,7 +13,13 @@
  */
 import { describe, it, expect } from 'vitest';
 import { computeNatal } from '../src/natal.js';
-import { buildLifeAlmanac } from '../src/lifeAlmanac.js';
+import {
+  almanacFingerprint,
+  applyNow,
+  buildLifeAlmanac,
+  horizonOf,
+  needsRecompute,
+} from '../src/lifeAlmanac.js';
 import type { BirthData } from '@astroapp/shared';
 
 const PERSON: BirthData = {
@@ -159,5 +165,193 @@ describe('Life Almanac', () => {
     expect(same).toBeDefined();
     expect(same!.isActive).toBe(true);
     expect(same!.isPast).toBe(false);
+  });
+});
+
+/**
+ * The cached-almanac path: rows in `life_almanac_cache` store the timeline as
+ * computed on some earlier day, and `applyNow` is what keeps them honest as
+ * time passes. If these break, a cached almanac silently shows last year's
+ * "happening now".
+ */
+describe('applyNow — re-deriving time-relative flags on a cached timeline', () => {
+  const birth: BirthData = {
+    date: '1990-05-21',
+    time: '12:00',
+    timeKnown: true,
+    lat: 38.7223,
+    lon: -9.1393,
+    tzIana: 'Europe/Lisbon',
+    houseSystem: 'placidus',
+  };
+  const natal = computeNatal(birth);
+  const built = buildLifeAlmanac(natal, birth.date, '2020-01-01T00:00:00.000Z');
+
+  it('leaves the events themselves untouched — only the flags move', () => {
+    const shifted = applyNow(built, '2030-01-01T00:00:00.000Z');
+    expect(shifted.events).toHaveLength(built.events.length);
+    for (const [i, e] of shifted.events.entries()) {
+      const original = built.events[i]!;
+      expect(e.id).toBe(original.id);
+      expect(e.exactDate).toBe(original.exactDate);
+      expect(e.startDate).toBe(original.startDate);
+      expect(e.endDate).toBe(original.endDate);
+      expect(e.significance).toBe(original.significance);
+    }
+  });
+
+  it('agrees with a freshly computed almanac for the same "now"', () => {
+    // The whole premise of the cache: re-flagging an old sweep must give the
+    // same answer as paying for a new one.
+    const now = '2024-06-01T00:00:00.000Z';
+    const fresh = buildLifeAlmanac(natal, birth.date, now);
+    const reflagged = applyNow(built, now);
+
+    for (const e of fresh.events) {
+      const cached = reflagged.events.find((c) => c.id === e.id);
+      // The 2020 sweep reaches to 2025, so every 2024-relevant event exists in
+      // both; anything beyond the old horizon is legitimately absent.
+      if (!cached) continue;
+      expect(cached.isActive, `isActive mismatch for ${e.id}`).toBe(e.isActive);
+      expect(cached.isPast, `isPast mismatch for ${e.id}`).toBe(e.isPast);
+    }
+  });
+
+  it('marks everything past once "now" is far beyond the timeline', () => {
+    const far = applyNow(built, '2200-01-01T00:00:00.000Z');
+    expect(far.events.every((e) => e.isPast)).toBe(true);
+    expect(far.events.some((e) => e.isActive)).toBe(false);
+  });
+
+  it('keeps past and active mutually exclusive', () => {
+    const shifted = applyNow(built, '2024-06-01T00:00:00.000Z');
+    expect(shifted.events.some((e) => e.isPast && e.isActive)).toBe(false);
+  });
+
+  it('restamps generatedAt to the moment asked for', () => {
+    expect(applyNow(built, '2024-06-01T00:00:00.000Z').generatedAt).toBe(
+      '2024-06-01T00:00:00.000Z',
+    );
+  });
+
+  it('rejects an unparseable now', () => {
+    expect(() => applyNow(built, 'not-a-date')).toThrow(/Invalid nowIso/);
+  });
+});
+
+/**
+ * The fingerprint is what stops the cache serving a stale person.
+ *
+ * `life_almanac_cache` is keyed by `birth_data_id`, and that id SURVIVES an
+ * edit — correcting a birth time or flipping tropical/sidereal rewrites the
+ * chart in place. Without a fingerprint the cache would hand back the pre-edit
+ * timeline forever, and it would look completely plausible.
+ */
+describe('almanacFingerprint — cache invalidation', () => {
+  const birth: BirthData = {
+    date: '1990-05-21',
+    time: '12:00',
+    timeKnown: true,
+    lat: 38.7223,
+    lon: -9.1393,
+    tzIana: 'Europe/Lisbon',
+    houseSystem: 'placidus',
+  };
+  const natal = computeNatal(birth);
+  const base = almanacFingerprint(natal, birth.date);
+
+  it('is stable across calls for identical inputs', () => {
+    expect(almanacFingerprint(computeNatal(birth), birth.date)).toBe(base);
+  });
+
+  it('changes when the birth TIME is corrected', () => {
+    const corrected = computeNatal({ ...birth, time: '14:05' });
+    expect(almanacFingerprint(corrected, birth.date)).not.toBe(base);
+  });
+
+  it('changes when the birth PLACE moves', () => {
+    const elsewhere = computeNatal({
+      ...birth,
+      lat: 51.5072,
+      lon: -0.1276,
+      tzIana: 'Europe/London',
+    });
+    expect(almanacFingerprint(elsewhere, birth.date)).not.toBe(base);
+  });
+
+  it('changes when the birth DATE changes', () => {
+    const other = { ...birth, date: '1990-05-22' };
+    expect(almanacFingerprint(computeNatal(other), other.date)).not.toBe(base);
+  });
+
+  it('changes when the birth time goes from known to unknown', () => {
+    const untimed = computeNatal({ ...birth, timeKnown: false });
+    expect(almanacFingerprint(untimed, birth.date)).not.toBe(base);
+  });
+
+  it('changes when a planet longitude moves, even slightly', () => {
+    // Stands in for a zodiac switch (sidereal shifts every longitude by the
+    // ayanamsa) — the id and birth date are identical, only the chart moved.
+    const shifted = {
+      ...natal,
+      planets: natal.planets.map((p, i) =>
+        i === 0 ? { ...p, absoluteDegree: p.absoluteDegree + 24 } : p,
+      ),
+    };
+    expect(almanacFingerprint(shifted, birth.date)).not.toBe(base);
+  });
+
+  it('is insensitive to the ORDER planets arrive in', () => {
+    // Same chart, different array order, must stay one cache entry.
+    const reversed = { ...natal, planets: [...natal.planets].reverse() };
+    expect(almanacFingerprint(reversed, birth.date)).toBe(base);
+  });
+
+  it('is insensitive to float noise below 1e-6 degrees', () => {
+    const jittered = {
+      ...natal,
+      planets: natal.planets.map((p) => ({ ...p, absoluteDegree: p.absoluteDegree + 1e-9 })),
+    };
+    expect(almanacFingerprint(jittered, birth.date)).toBe(base);
+  });
+});
+
+/**
+ * The cache-freshness rule. Getting this wrong is quiet in both directions: too
+ * strict and the cache never hits (we are back to a full sweep per open); too
+ * loose and the timeline's far tail silently runs out.
+ */
+describe('cache horizon', () => {
+  it('a sweep written today reaches five years out', () => {
+    expect(horizonOf('2026-08-08T00:00:00.000Z')).toBe('2031-08-08');
+  });
+
+  it('accepts a cache written today', () => {
+    const now = '2026-08-08T00:00:00.000Z';
+    expect(needsRecompute(horizonOf(now), now)).toBe(false);
+  });
+
+  it('still accepts a cache written eleven months ago', () => {
+    // The whole point: someone opening the screen daily must not pay for a
+    // fresh sweep every day just because the tail thinned by a few weeks.
+    expect(needsRecompute(horizonOf('2025-09-08T00:00:00.000Z'), '2026-08-08T00:00:00.000Z')).toBe(
+      false,
+    );
+  });
+
+  it('rebuilds a cache written over a year ago', () => {
+    expect(needsRecompute(horizonOf('2025-06-08T00:00:00.000Z'), '2026-08-08T00:00:00.000Z')).toBe(
+      true,
+    );
+  });
+
+  it('rebuilds when the stored horizon is already in the past', () => {
+    expect(needsRecompute('2020-01-01', '2026-08-08T00:00:00.000Z')).toBe(true);
+  });
+
+  it('rebuilds rather than trusting an unparseable horizon', () => {
+    // Date.parse -> NaN, and NaN < x is false, so a naive implementation would
+    // treat garbage as FRESH and serve it forever. Assert the safe direction.
+    expect(needsRecompute('not-a-date', '2026-08-08T00:00:00.000Z')).toBe(true);
   });
 });

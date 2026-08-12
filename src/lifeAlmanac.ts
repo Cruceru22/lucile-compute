@@ -58,7 +58,111 @@ export interface AlmanacEvent {
 }
 
 /** Years past `now` we extend the timeline to (look-ahead horizon). */
-const LOOKAHEAD_YEARS = 5;
+export const LOOKAHEAD_YEARS = 5;
+
+/**
+ * Bump when a change to this module would produce DIFFERENT events for the same
+ * birth data — new bodies, changed orbs, retuned significance, altered copy.
+ * Cached rows carrying an older version are ignored and recomputed, so a
+ * deploy never serves a stale timeline shape out of the database.
+ */
+export const ALMANAC_VERSION = 1;
+
+/** ISO date (YYYY-MM-DD) the sweep starting at `nowIso` reaches out to. */
+export function horizonOf(nowIso: string): string {
+  const d = new Date(nowIso);
+  d.setUTCFullYear(d.getUTCFullYear() + LOOKAHEAD_YEARS);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Whether a cached sweep reaching to `computedThrough` is still deep enough.
+ *
+ * A cache written a year ago only reaches four years ahead, so its tail is
+ * thinner than a fresh one. Rather than recompute the moment it is one day
+ * short — which would defeat the cache entirely for anyone who opens the screen
+ * daily — we let the horizon erode by up to a year before rebuilding. Events
+ * inside the retained window are identical either way; only the far tail is
+ * affected, and it is years out.
+ */
+export function needsRecompute(computedThrough: string, nowIso: string): boolean {
+  const stored = Date.parse(computedThrough);
+  // An unparseable horizon must fail TOWARDS recomputing. `NaN < x` is false,
+  // so comparing directly would classify a corrupt row as fresh and serve it
+  // forever — the one outcome this function exists to prevent.
+  if (Number.isNaN(stored)) return true;
+  const required = new Date(nowIso);
+  required.setUTCFullYear(required.getUTCFullYear() + LOOKAHEAD_YEARS - 1);
+  return stored < required.getTime();
+}
+
+/**
+ * A stable fingerprint of every input {@link buildLifeAlmanac} actually reads.
+ *
+ * The cache is keyed by `birth_data_id`, which is NOT enough on its own: that
+ * id survives an edit. Correcting a birth time, or switching the chart between
+ * tropical and sidereal, rewrites the very numbers the sweep is built from
+ * while the id stays put — so a key-only cache would keep serving the old
+ * person's timeline indefinitely, with nothing on screen to suggest it.
+ *
+ * Comparing a fingerprint instead makes the cache self-invalidating: if any
+ * input moved, the stored row simply stops matching and we recompute. That is
+ * strictly safer than remembering to bust the cache from every write path, and
+ * it needs no triggers on `birth_data` or `charts`.
+ *
+ * Covers exactly what the builder consumes — birth date, timed-ness, the two
+ * angles, and each planet's absolute longitude. Longitudes are fixed to 6dp so
+ * float noise in the last bits cannot cause a spurious miss.
+ */
+export function almanacFingerprint(natal: NatalChart, birthIso: string): string {
+  const planets = [...natal.planets]
+    .map((p) => `${p.name}:${p.absoluteDegree.toFixed(6)}`)
+    .sort()
+    .join(',');
+  return [
+    `v${ALMANAC_VERSION}`,
+    birthIso,
+    `timed:${natal.housesAvailable !== false}`,
+    `asc:${typeof natal.ascendant === 'number' ? natal.ascendant.toFixed(6) : 'none'}`,
+    `mc:${typeof natal.midheaven === 'number' ? natal.midheaven.toFixed(6) : 'none'}`,
+    planets,
+  ].join('|');
+}
+
+/**
+ * Re-derive the time-relative flags on an already-computed timeline.
+ *
+ * WHICH events exist, and their dates, depend only on the natal chart — that is
+ * the expensive ephemeris sweep, and it is what we cache. Only `isPast` and
+ * `isActive` depend on the moment you ask. Recomputing just those two from the
+ * stored dates is pure arithmetic, so a cached almanac reads correctly tomorrow
+ * without touching the ephemeris.
+ *
+ * Kept byte-identical in logic to `materialize`'s own flag computation below —
+ * if you change the active-window rule there, change it here.
+ */
+export function applyNow(result: LifeAlmanacResult, nowIso: string): LifeAlmanacResult {
+  const nowMs = DateTime.fromISO(nowIso, { zone: 'utc' }).toMillis();
+  if (Number.isNaN(nowMs)) throw new Error('Invalid nowIso supplied to applyNow.');
+
+  return {
+    ...result,
+    generatedAt: nowIso,
+    events: result.events.map((e) => {
+      const startMs = Date.parse(e.startDate);
+      const endMs = Date.parse(e.endDate);
+      const exactMs = Date.parse(e.exactDate);
+      const orbMs = orbWindowMs(e.transiting);
+      const activeStartMs = Math.min(startMs, exactMs) - orbMs;
+      const activeEndMs = Math.max(endMs, exactMs) + orbMs;
+      return {
+        ...e,
+        isActive: nowMs >= activeStartMs && nowMs <= activeEndMs,
+        isPast: activeEndMs < nowMs,
+      };
+    }),
+  };
+}
 
 /** Slow transiting planets that drive life-transits. Fast bodies are noise here. */
 const SLOW_BODIES: PlanetName[] = ['Saturn', 'Uranus', 'Neptune', 'Pluto', 'Chiron'];
@@ -243,32 +347,67 @@ function refine(
 }
 
 /**
- * Find every exact pass of `transiting` to natal longitude `natalLon` for the
- * given aspects across [jdFrom, jdTo], by sampling `signedDelta` on a coarse
- * grid and bisecting each sign change. Robust for conj/opp because δ is signed.
+ * One transiting body's longitude sampled on the coarse grid, computed ONCE.
+ *
+ * This is the whole performance story of this module. The grid for a given body
+ * does not depend on which natal point or aspect we are hunting, but the sweep
+ * used to live inside `findPasses` — so every (target × aspect × offset)
+ * combination re-walked the same ~3k Julian Days through the ephemeris. For a
+ * timed chart that is 5 bodies × 7 targets × 8 offsets ≈ 280 sweeps of
+ * identical work, ~0.9M ephemeris calls, and 8–12s of CPU for one timeline.
+ *
+ * Sampling per body instead makes it 5 sweeps (~15k calls). The crossing
+ * detection and bisection below are untouched, so the events produced are
+ * bit-for-bit the same — this is a caching change, not a numerical one.
+ */
+interface BodySamples {
+  name: PlanetName;
+  jds: number[];
+  lons: number[];
+}
+
+/**
+ * The coarse grid: `jdFrom`, then every `SLOW_STEP_DAYS` up to `jdTo`. Kept as
+ * its own function so the sample arrays and the (unchanged) loop bounds cannot
+ * drift apart.
+ */
+function gridJds(jdFrom: number, jdTo: number): number[] {
+  const out: number[] = [jdFrom];
+  for (let jd = jdFrom + SLOW_STEP_DAYS; jd <= jdTo + 1e-9; jd += SLOW_STEP_DAYS) {
+    out.push(Math.min(jd, jdTo));
+  }
+  return out;
+}
+
+/** Walk one body across the grid once. Throws iff the body is uncomputable. */
+function sampleBody(name: PlanetName, jdFrom: number, jdTo: number): BodySamples {
+  const jds = gridJds(jdFrom, jdTo);
+  const lons = jds.map((jd) => lonAt(jd, name));
+  return { name, jds, lons };
+}
+
+/**
+ * Find every exact pass of a sampled body to natal longitude `natalLon` for the
+ * given aspects, by scanning `signedDelta` over the pre-computed samples and
+ * bisecting each sign change. Robust for conj/opp because δ is signed.
  */
 function findPasses(
-  transiting: PlanetName,
+  samples: BodySamples,
   natalLon: number,
   aspects: AspectType[],
-  jdFrom: number,
-  jdTo: number,
 ): { aspect: AspectType; jd: number }[] {
   const out: { aspect: AspectType; jd: number }[] = [];
+  const { jds, lons, name } = samples;
   for (const aspect of aspects) {
     for (const offset of offsetsFor(aspect)) {
-      let jdPrev = jdFrom;
-      let fPrev = signedDelta(lonAt(jdPrev, transiting), natalLon, offset);
-      for (let jd = jdFrom + SLOW_STEP_DAYS; jd <= jdTo + 1e-9; jd += SLOW_STEP_DAYS) {
-        const jdCur = Math.min(jd, jdTo);
-        const fCur = signedDelta(lonAt(jdCur, transiting), natalLon, offset);
+      let fPrev = signedDelta(lons[0]!, natalLon, offset);
+      for (let i = 1; i < jds.length; i++) {
+        const fCur = signedDelta(lons[i]!, natalLon, offset);
         // A sign change with a SHORT span means a true crossing (not the ±180
         // wrap discontinuity, which only appears for a stationary-far body).
         if (fPrev !== 0 && Math.sign(fCur) !== Math.sign(fPrev) && Math.abs(fCur - fPrev) < 180) {
-          const jdExact = refine(jdPrev, jdCur, transiting, natalLon, offset);
-          out.push({ aspect, jd: jdExact });
+          out.push({ aspect, jd: refine(jds[i - 1]!, jds[i]!, name, natalLon, offset) });
         }
-        jdPrev = jdCur;
         fPrev = fCur;
       }
     }
@@ -277,36 +416,44 @@ function findPasses(
 }
 
 /**
- * Skip transiting bodies the active backend cannot compute (e.g. Chiron under
- * the Moshier fallback, which lacks the asteroid ephemeris files). Probe once.
+ * Sample each body once, skipping those the active backend cannot compute (e.g.
+ * Chiron under the Moshier fallback, which lacks the asteroid ephemeris files).
+ *
+ * This doubles as the old `computable` probe: a body that throws anywhere on
+ * the grid is dropped entirely, exactly as a failed probe used to drop it.
  */
-function computable(name: PlanetName, jdProbe: number): boolean {
-  try {
-    lonAt(jdProbe, name);
-    return true;
-  } catch {
-    return false;
+function sampleBodies(
+  names: readonly PlanetName[],
+  jdFrom: number,
+  jdTo: number,
+): Map<PlanetName, BodySamples> {
+  const out = new Map<PlanetName, BodySamples>();
+  for (const name of names) {
+    try {
+      out.set(name, sampleBody(name, jdFrom, jdTo));
+    } catch {
+      // Uncomputable under this ephemeris backend — omit it.
+    }
   }
+  return out;
 }
 
 /**
  * Personalized outer-planet passes: each slow body against each personal target
- * point, for the given aspect set.
+ * point, for the given aspect set. Takes pre-sampled bodies so the two aspect
+ * sets (hard + soft) share one sweep.
  */
 function personalPasses(
   targets: NatalPoint[],
-  transitingBodies: PlanetName[],
+  samples: Map<PlanetName, BodySamples>,
   aspects: AspectType[],
-  jdFrom: number,
-  jdTo: number,
 ): RawPass[] {
   const out: RawPass[] = [];
-  for (const body of transitingBodies) {
-    if (!computable(body, jdFrom)) continue;
+  for (const body of samples.values()) {
     for (const target of targets) {
-      for (const hit of findPasses(body, target.lon, aspects, jdFrom, jdTo)) {
+      for (const hit of findPasses(body, target.lon, aspects)) {
         out.push({
-          transiting: body,
+          transiting: body.name,
           natalPoint: target.name,
           aspect: hit.aspect,
           exactIso: julianDayToIso(hit.jd),
@@ -322,7 +469,11 @@ function personalPasses(
  * longitude. Conjunction = return; square/opposition = cycle phases. The Node,
  * Jupiter and Chiron carry only their conjunction (return).
  */
-function cyclePasses(natal: NatalChart, jdFrom: number, jdTo: number): RawPass[] {
+function cyclePasses(
+  natal: NatalChart,
+  samples: Map<PlanetName, BodySamples>,
+  jdFrom: number,
+): RawPass[] {
   const byName = new Map(natal.planets.map((p) => [p.name, p]));
   const out: RawPass[] = [];
   // A slow body sits ON its natal degree at birth; for the first months it may
@@ -333,12 +484,13 @@ function cyclePasses(natal: NatalChart, jdFrom: number, jdTo: number): RawPass[]
   const minJd = jdFrom + 3 * 365.25;
   for (const body of CYCLE_BODIES) {
     const self = byName.get(body);
-    if (!self || !computable(body, jdFrom)) continue;
+    const sampled = samples.get(body);
+    if (!self || !sampled) continue;
     const aspects: AspectType[] =
       body === 'NorthNode' || body === 'Jupiter' || body === 'Chiron'
         ? ['conjunction']
         : ['conjunction', 'square', 'opposition'];
-    for (const hit of findPasses(body, self.absoluteDegree, aspects, jdFrom, jdTo)) {
+    for (const hit of findPasses(sampled, self.absoluteDegree, aspects)) {
       if (hit.jd < minJd) continue;
       out.push({
         transiting: body,
@@ -623,14 +775,25 @@ export function buildLifeAlmanac(
   const jdFrom = dateTimeToJulianDay(birth);
   const jdTo = dateTimeToJulianDay(now.plus({ years: LOOKAHEAD_YEARS }));
 
+  // Sample every body ONCE across the sweep. Both passes below read these
+  // arrays; nothing re-walks the ephemeris per target or per aspect.
+  const bodyNames = [...new Set([...CYCLE_BODIES, ...SLOW_BODIES])];
+  const samples = sampleBodies(bodyNames, jdFrom, jdTo);
+
   // 1. Returns + cycle phases (universal milestones).
-  const cycleRaw = cyclePasses(natal, jdFrom, jdTo);
+  const cycleRaw = cyclePasses(natal, samples, jdFrom);
 
   // 2. Personalized outer-planet hits (hard + soft) to personal points.
   const targets = personalTargets(natal);
+  const slowSamples = new Map(
+    SLOW_BODIES.flatMap((n) => {
+      const s = samples.get(n);
+      return s ? [[n, s] as const] : [];
+    }),
+  );
   const personalRaw = [
-    ...personalPasses(targets, SLOW_BODIES, HARD, jdFrom, jdTo),
-    ...personalPasses(targets, SLOW_BODIES, SOFT, jdFrom, jdTo),
+    ...personalPasses(targets, slowSamples, HARD),
+    ...personalPasses(targets, slowSamples, SOFT),
   ];
 
   const events: AlmanacEvent[] = [];

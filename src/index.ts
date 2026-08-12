@@ -50,7 +50,15 @@ import { computeSynastry } from './synastry.js';
 import { computeComposite, computeDavison } from './relationship.js';
 import { computeProgressions } from './progressions.js';
 import { computeRectification, type RectifyRequest } from './rectification.js';
-import { buildLifeAlmanac } from './lifeAlmanac.js';
+import {
+  ALMANAC_VERSION,
+  almanacFingerprint,
+  applyNow,
+  buildLifeAlmanac,
+  horizonOf,
+  needsRecompute,
+  type LifeAlmanacResult,
+} from './lifeAlmanac.js';
 import { buildElectional } from './electional.js';
 import { createProvider } from './ai/provider.js';
 import { isDailyQuotaError } from './ai/gemini-provider.js';
@@ -61,6 +69,7 @@ import {
   authenticate,
   checkEntitlement,
   EntitlementUnavailableError,
+  loadAlmanacCache,
   loadBirthData,
   loadChart,
   loadChartByBirthDataId,
@@ -69,6 +78,8 @@ import {
   loadPeopleWithBirth,
   loadSelfChart,
   normalizeAlternation,
+  recordReport,
+  saveAlmanacCache,
   saveConversationTurn,
   StorageUnavailableError,
   trimLeadingAssistantTurns,
@@ -692,6 +703,18 @@ export function buildApp() {
       );
       const pdf = await renderReportPdf(report);
       const { path, signedUrl } = await uploadReport(user, kind, pdf);
+      // Record it in the user's library so this report is findable FOREVER, not
+      // just for as long as the client holds this signed URL in memory. Awaited
+      // (it never throws) so the row exists by the time the app refreshes its
+      // list on the response.
+      await recordReport(user, {
+        kind,
+        title: report.title,
+        path,
+        // Annual reports carry the year they forecast — either the requested one
+        // or, when omitted, the year the window starts in (`nowIso`).
+        ...(kind === 'annual' ? { year: year ?? new Date(nowIso).getUTCFullYear() } : {}),
+      });
       return {
         ok: true,
         kind,
@@ -752,7 +775,33 @@ export function buildApp() {
     }
 
     try {
-      const almanac = buildLifeAlmanac(chart, birth.date, new Date().toISOString());
+      const nowIso = new Date().toISOString();
+
+      // Serve from the cache when one is present, current, and still reaches
+      // far enough into the future. The stored timeline is the expensive part
+      // (a full ephemeris sweep); `applyNow` re-derives the only two fields
+      // that depend on today, so a hit is correct without recomputing.
+      // Fingerprint the inputs so an edited birth time or a zodiac switch can
+      // never be served from a row keyed only on the (unchanged) birth id.
+      const fingerprint = almanacFingerprint(chart, birth.date);
+      const cached = await loadAlmanacCache(user, birth.id!, ALMANAC_VERSION, fingerprint);
+      if (cached && !needsRecompute(cached.computedThrough, nowIso)) {
+        return applyNow(cached.payload as LifeAlmanacResult, nowIso);
+      }
+
+      const almanac = buildLifeAlmanac(chart, birth.date, nowIso);
+
+      // Best-effort write: a cache failure costs one recompute next time and
+      // must never fail a response we have already computed correctly.
+      await saveAlmanacCache(
+        user,
+        birth.id!,
+        almanac,
+        ALMANAC_VERSION,
+        fingerprint,
+        horizonOf(nowIso),
+      );
+
       return almanac;
     } catch (err) {
       return reply.status(502).send({

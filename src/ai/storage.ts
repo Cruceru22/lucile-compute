@@ -868,3 +868,140 @@ export async function uploadReport(
   }
   return { path, signedUrl: data.signedUrl };
 }
+
+/** What a finished report records in the user's library (see {@link recordReport}). */
+export interface ReportLibraryEntry {
+  kind: string;
+  /** The generated title, kept as reference metadata (the app renders a localized name). */
+  title: string;
+  /** Object key in the `reports` bucket, as returned by {@link uploadReport}. */
+  path: string;
+  /** Annual forecasts only: the calendar year covered. */
+  year?: number;
+}
+
+/**
+ * Record a generated report in `ai_reports` so the user can find it again.
+ *
+ * The signed URL we hand back lives only in client memory; the ROW is what makes
+ * a report durable — the app lists it and mints a fresh signed URL whenever the
+ * user opens it, long after the original link expired.
+ *
+ * NON-FATAL by contract, like {@link saveConversationTurn}: the PDF is already
+ * uploaded and the caller is about to return a working link, so a failed insert
+ * (e.g. the migration isn't applied yet) must never turn a successful, BILLED
+ * generation into an error. It is logged, not thrown. NEVER throws.
+ */
+export async function recordReport(user: AuthedUser, entry: ReportLibraryEntry): Promise<void> {
+  try {
+    const { error } = await user.client.from('ai_reports').insert({
+      // The service role bypasses RLS, so ownership is set explicitly.
+      user_id: user.userId,
+      kind: entry.kind,
+      title: entry.title,
+      year: entry.year ?? null,
+      storage_path: entry.path,
+    });
+    if (error) console.warn('[storage] recordReport failed:', error.message);
+  } catch (error) {
+    console.warn(
+      '[storage] recordReport threw:',
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
+
+/** A cached Life Almanac row, already validated against version + fingerprint. */
+export interface AlmanacCacheHit {
+  payload: unknown;
+  computedThrough: string;
+}
+
+/**
+ * Read a cached Life Almanac for one birth record.
+ *
+ * Returns null on a miss, on a version mismatch, or on ANY failure — a cache
+ * that cannot be read must degrade to a recompute, never to an error. The
+ * caller treats null as "compute it".
+ *
+ * `version` is compared here rather than by the caller so a stale row can never
+ * escape this function.
+ */
+export async function loadAlmanacCache(
+  user: AuthedUser,
+  birthDataId: string,
+  version: number,
+  fingerprint: string,
+): Promise<AlmanacCacheHit | null> {
+  try {
+    const { data, error } = await user.client
+      .from('life_almanac_cache')
+      .select('payload, version, computed_through, fingerprint')
+      // Scope to the caller (defense in depth: the service role bypasses RLS).
+      .eq('user_id', user.userId)
+      .eq('birth_data_id', birthDataId)
+      .maybeSingle();
+    if (error) {
+      console.warn('[storage] loadAlmanacCache failed:', error.message);
+      return null;
+    }
+    if (!data) return null;
+    const row = data as {
+      payload: unknown;
+      version: number;
+      computed_through: string;
+      fingerprint: string;
+    };
+    // Either mismatch means the stored timeline is not this person's any more:
+    // `version` catches an algorithm change, `fingerprint` catches an edited
+    // birth time / place or a zodiac switch (the row id survives all of those).
+    if (row.version !== version) return null;
+    if (row.fingerprint !== fingerprint) return null;
+    return { payload: row.payload, computedThrough: row.computed_through };
+  } catch (error) {
+    console.warn(
+      '[storage] loadAlmanacCache threw:',
+      error instanceof Error ? error.message : String(error),
+    );
+    return null;
+  }
+}
+
+/**
+ * Write (or replace) the cached Life Almanac for one birth record.
+ *
+ * NON-FATAL by contract, like {@link recordReport}: the caller has already
+ * computed a correct timeline and is about to return it. A failed upsert (the
+ * migration not yet applied, a transient write error) costs one recompute next
+ * time and must never turn a successful response into an error. NEVER throws.
+ */
+export async function saveAlmanacCache(
+  user: AuthedUser,
+  birthDataId: string,
+  payload: unknown,
+  version: number,
+  fingerprint: string,
+  computedThrough: string,
+): Promise<void> {
+  try {
+    const { error } = await user.client.from('life_almanac_cache').upsert(
+      {
+        birth_data_id: birthDataId,
+        // The service role bypasses RLS, so ownership is set explicitly.
+        user_id: user.userId,
+        payload,
+        version,
+        fingerprint,
+        computed_through: computedThrough,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'birth_data_id' },
+    );
+    if (error) console.warn('[storage] saveAlmanacCache failed:', error.message);
+  } catch (error) {
+    console.warn(
+      '[storage] saveAlmanacCache threw:',
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
