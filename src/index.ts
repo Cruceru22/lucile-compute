@@ -62,8 +62,12 @@ import {
 import { buildElectional } from './electional.js';
 import { createProvider } from './ai/provider.js';
 import { isDailyQuotaError } from './ai/gemini-provider.js';
-import { generateReport, interpretChat } from './ai/reportInterpreter.js';
-import { buildContextSections, validateTodayContext } from './ai/contextInjection.js';
+import { generateReport, interpretChat, type RelationshipContext } from './ai/reportInterpreter.js';
+import {
+  buildContextSections,
+  sanitizeContextText,
+  validateTodayContext,
+} from './ai/contextInjection.js';
 import { renderReportPdf } from './ai/pdf.js';
 import {
   authenticate,
@@ -73,10 +77,13 @@ import {
   loadBirthData,
   loadChart,
   loadChartByBirthDataId,
+  loadConnectionChart,
+  loadConnectionPeople,
   loadConversationHistory,
   loadDiscoverableCandidates,
   loadPeopleWithBirth,
   loadSelfChart,
+  placementSummary,
   normalizeAlternation,
   recordReport,
   saveAlmanacCache,
@@ -616,7 +623,7 @@ export function buildApp() {
     const user = await requirePremium(request, reply);
     if (!user) return reply;
 
-    const { kind, chartId, partnerChartId, labels, year } = parsed.data;
+    const { kind, chartId, partnerChartId, partnerConnectionId, labels, year } = parsed.data;
     // Ground the report's PRIMARY chart on the canonical SELF record, never the
     // newest chart across ALL birth_data rows. Saved partners/exes are upserted
     // under the user's own user_id, so loadChart() with no chartId could return a
@@ -637,13 +644,29 @@ export function buildApp() {
         primaryBirthDate = birth?.date;
       }
       if (kind === 'compatibility') {
-        // A compatibility report REQUIRES a real second chart. Without a
-        // partnerChartId (or when its chart can't be loaded) we must NOT silently
-        // downgrade to a single-chart reading titled "Compatibility Report" —
-        // reject so the client supplies a partner.
-        if (!partnerChartId) return reply.status(400).send({ error: 'partner_required' });
-        const partner = await loadChart(user, partnerChartId);
-        if (!partner) return reply.status(404).send({ error: 'partner_required' });
+        // A compatibility report REQUIRES a real second chart. Without one we
+        // must NOT silently downgrade to a single-chart reading titled
+        // "Compatibility Report" — reject so the client supplies a partner.
+        //
+        // The second person is either a profile the caller owns (a chart id) or
+        // an accepted friend (a connection id). The connection path resolves
+        // through the consent gate in `loadConnectionChart` and yields only
+        // their computed chart, so a friend can be read into a report without
+        // their birth details ever reaching this process.
+        if (!partnerChartId && !partnerConnectionId) {
+          return reply.status(400).send({ error: 'partner_required' });
+        }
+        const partner = partnerConnectionId
+          ? (await loadConnectionChart(user.userId, partnerConnectionId))?.chart
+          : await loadChart(user, partnerChartId);
+        if (!partner) {
+          // Distinct code for the connection path: "we could not read that
+          // person's chart" is a different fix (they need a chart / the
+          // connection is no longer live) from "you named nobody".
+          return reply
+            .status(404)
+            .send({ error: partnerConnectionId ? 'partner_unavailable' : 'partner_required' });
+        }
         charts.push(partner);
       }
     } catch (err) {
@@ -671,7 +694,7 @@ export function buildApp() {
     // double-submit). Concurrent duplicates ride the first generation's promise
     // instead of triggering a second paid run + orphaned PDF. Keyed per user so
     // it can never collide across users. The provider variable is captured above.
-    const idemKey = `${user.userId}:${kind}:${chartId ?? ''}:${partnerChartId ?? ''}:${year ?? ''}`;
+    const idemKey = `${user.userId}:${kind}:${chartId ?? ''}:${partnerChartId ?? partnerConnectionId ?? ''}:${year ?? ''}`;
 
     // Map a generation failure to a reply, distinguishing a per-DAY AI quota
     // (429 "resets tomorrow") from a generic transient failure (502).
@@ -984,6 +1007,10 @@ export function buildApp() {
     return { matches: matches.slice(0, limit ?? 20) };
   });
 
+  // A connected friend's display name is written by SOMEBODY ELSE, so it is
+  // bounded as well as neutralised before it reaches the prompt.
+  const FRIEND_NAME_MAX_CHARS = 48;
+
   // Conversational AI astrologer (TASK A8): grounded, validated chat turn against
   // the user's own chart. Replaces the never-deployed `ai-interpret` Edge Function
   // — same Gemini provider + anti-hallucination machinery as /report.
@@ -1038,15 +1065,26 @@ export function buildApp() {
       return reply.status(500).send({ error: 'provider_unconfigured' });
     }
 
-    // Load saved people WITH birth data + the user's own birth data, so the
-    // assistant can compute synastry/compatibility on demand when asked about a
-    // specific person (grounded, never invented).
+    // WHO the user has in their life, from BOTH sources, so the assistant can
+    // compute synastry/compatibility on demand for any of them (grounded, never
+    // invented):
+    //   * saved people — `birth_data` rows the user owns, loaded WITH the birth
+    //     instant, so their charts are computed exactly;
+    //   * connected friends — accepted connections, loaded through the same
+    //     consent gate the People tab uses, which yields their COMPUTED chart
+    //     and never their birth date, time or place.
+    // Without the second source the chat knew a friend's chart existed on every
+    // other screen and answered "you have not added them" here.
     let selfBirth;
-    let relationships;
+    let saved;
+    let connected;
     try {
-      [selfBirth, relationships] = await Promise.all([
+      [selfBirth, saved, connected] = await Promise.all([
         loadBirthData(user),
         loadPeopleWithBirth(user),
+        // Best-effort by contract: never fails the turn, but reports when it
+        // could not look so the prompt can say so instead of claiming nobody.
+        loadConnectionPeople(user.userId),
       ]);
     } catch (err) {
       if (err instanceof StorageUnavailableError) {
@@ -1054,6 +1092,28 @@ export function buildApp() {
       }
       throw err;
     }
+    const relationships: RelationshipContext[] = [
+      ...saved.map((p) => ({ source: 'profile' as const, ...p })),
+      ...connected.people.map((f) => {
+        // A friend's display name is theirs to set; when they have set none the
+        // generic label is the honest one. Their relationship to the user is
+        // not ours to label either, so it stays the neutral 'connection'.
+        //
+        // SANITISED, unlike a saved person's name: this string was typed by
+        // ANOTHER user and is about to be embedded in the system prompt, so it
+        // goes through the same neutraliser as journal text (no angle brackets
+        // to fake a section tag, no control characters, bounded length).
+        const summary = placementSummary(f.chart);
+        const name = sanitizeContextText(f.displayName ?? '', FRIEND_NAME_MAX_CHARS);
+        return {
+          source: 'connection' as const,
+          name: name || 'A friend in the app',
+          relationship: 'connection',
+          chart: f.chart,
+          ...(summary ? { placements: summary } : {}),
+        };
+      }),
+    ];
     // Server-side memory fallback: if resuming a thread but the client sent no
     // history (offline / failed loadMessages), reload it from ai_messages so the
     // model actually remembers instead of silently losing context.
@@ -1081,6 +1141,7 @@ export function buildApp() {
         relationships,
         selfBirth,
         contextSections,
+        { friendsUnreadable: connected.unavailable },
       );
       // Persist this turn server-side so the thread list + resume work. NON-FATAL:
       // saveConversationTurn never throws — on a DB failure it returns the

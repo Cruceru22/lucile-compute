@@ -24,7 +24,7 @@ import type { BirthData, PlanetName, TransitEvent } from '@astroapp/shared';
 import { DateTime } from 'luxon';
 import { scoreCompatibility } from '../compatibility.js';
 import { computeNatal } from '../natal.js';
-import { computeSynastry } from '../synastry.js';
+import { computeSynastry, synastryFromCharts } from '../synastry.js';
 import { computeTransits } from '../transits.js';
 import type { AIProvider, ContentBlock, ProviderMessage, ToolSpec } from './provider.js';
 
@@ -364,11 +364,13 @@ function dispatch(
   }
 }
 
-/** A saved person, with the birth data needed to compute their chart + synastry. */
-export interface RelationshipContext {
+/** Where a person in the chat's context came from, and how their chart is got. */
+export type RelationshipSource = 'profile' | 'connection';
+
+/** Everything the two kinds of person share. */
+interface RelationshipBase {
   name: string;
   relationship: string;
-  birth: BirthData;
   /**
    * Compact placement summary from the person's computed chart, e.g. "Sun in
    * Aries, Moon in Cancer, …". Factual ground truth listed in the system
@@ -376,6 +378,30 @@ export interface RelationshipContext {
    */
   placements?: string;
 }
+
+/**
+ * Someone the user SAVED: a `birth_data` row they own (a partner, an ex, a
+ * parent). We hold the birth instant, so their chart and the synastry with it
+ * are computed exactly, applying/separating included.
+ */
+export interface SavedProfileContext extends RelationshipBase {
+  source: 'profile';
+  birth: BirthData;
+}
+
+/**
+ * Someone the user is CONNECTED to in the app. An accepted connection shares
+ * the friend's COMPUTED chart and nothing else — their birth date, time and
+ * place stay with them — so this carries the chart itself and the synastry is
+ * derived from the two charts' positions.
+ */
+export interface ConnectedFriendContext extends RelationshipBase {
+  source: 'connection';
+  chart: NatalChart;
+}
+
+/** A person the chat may speak about, from either source. */
+export type RelationshipContext = SavedProfileContext | ConnectedFriendContext;
 
 /**
  * Lazily-computed, GROUNDED relationship facts for the chat assistant: a saved
@@ -386,10 +412,12 @@ export interface RelationshipContext {
  * computed on demand and cached for the turn (no cost unless actually asked).
  */
 class RelationshipTools {
-  private readonly chartCache = new Map<string, NatalChart>();
+  /** Keyed by the person object, so two people sharing a name never collide. */
+  private readonly chartCache = new Map<RelationshipContext, NatalChart>();
 
   constructor(
     private readonly selfBirth: BirthData | null,
+    private readonly selfChart: NatalChart,
     private readonly people: RelationshipContext[],
   ) {}
 
@@ -407,34 +435,72 @@ class RelationshipTools {
   }
 
   private chartFor(p: RelationshipContext): NatalChart {
-    let chart = this.chartCache.get(p.name);
+    // A connected friend arrives WITH their chart (their birth data is never
+    // read), so there is nothing to compute or cache.
+    if (p.source === 'connection') return p.chart;
+    let chart = this.chartCache.get(p);
     if (!chart) {
       chart = computeNatal(p.birth) as unknown as NatalChart;
-      this.chartCache.set(p.name, chart);
+      this.chartCache.set(p, chart);
     }
     return chart;
   }
 
+  /** Names for an `unknown_person` reply, marking which are app friends. */
+  private knownNames(): string[] {
+    return this.people.map((p) =>
+      p.source === 'connection' ? `${p.name} (friend in the app)` : p.name,
+    );
+  }
+
+  /**
+   * Whether a birth time is on record for the user. Saved birth data says so
+   * directly; a chart carries the flag too, and older charts that predate the
+   * field state the same fact by having houses at all.
+   */
+  private get selfTimeKnown(): boolean {
+    return (
+      this.selfBirth?.timeKnown ??
+      this.selfChart.timeKnown ??
+      this.selfChart.housesAvailable ??
+      this.selfChart.houses.length > 0
+    );
+  }
+
   getPersonPlacement(name: string, body: string): unknown {
     const p = this.find(name);
-    if (!p) return { error: 'unknown_person', known: this.people.map((x) => x.name) };
+    if (!p) return { error: 'unknown_person', known: this.knownNames() };
     return {
       person: p.name,
+      source: p.source,
       ...((new ChartFactTools(this.chartFor(p)).getPlanet(body) as object) ?? {}),
     };
   }
 
   getCompatibility(name: string): unknown {
     const p = this.find(name);
-    if (!p) return { error: 'unknown_person', known: this.people.map((x) => x.name) };
-    if (!this.selfBirth) return { error: 'no_self_birth_data' };
-    const synastry = computeSynastry(this.selfBirth, p.birth);
-    const compat = scoreCompatibility(synastry.aspects, {
-      timeKnownA: this.selfBirth.timeKnown,
-      timeKnownB: p.birth.timeKnown,
+    if (!p) return { error: 'unknown_person', known: this.knownNames() };
+    // A saved person is scored from both birth instants. A connected friend has
+    // shared only their computed chart, so the cross-chart aspects come from the
+    // two charts' positions instead; `scoreCompatibility` reads the same aspect
+    // list either way, so neither source is scored on softer evidence.
+    let aspects;
+    let timeKnownB: boolean;
+    if (p.source === 'profile') {
+      if (!this.selfBirth) return { error: 'no_self_birth_data' };
+      aspects = computeSynastry(this.selfBirth, p.birth).aspects;
+      timeKnownB = p.birth.timeKnown;
+    } else {
+      aspects = synastryFromCharts(this.selfChart, p.chart).aspects;
+      timeKnownB = p.chart.timeKnown ?? p.chart.housesAvailable ?? p.chart.houses.length > 0;
+    }
+    const compat = scoreCompatibility(aspects, {
+      timeKnownA: this.selfTimeKnown,
+      timeKnownB,
     });
     return {
       person: p.name,
+      source: p.source,
       relationship: p.relationship,
       score: compat.score,
       band: compat.bandLabel,
@@ -453,26 +519,28 @@ function relationshipToolSpecs(people: RelationshipContext[]): ToolSpec[] {
     {
       name: 'get_compatibility',
       description:
-        'Compatibility (synastry) between YOU and a saved person, by their name. Returns an ' +
-        'overall score (0-100), a band label, per-domain scores (romantic, emotional, ' +
-        'communication, values, long-term), and the strongest harmonious and frictional ' +
-        'cross-chart contacts. Use this for ANY question about how you get along with, or your ' +
-        'compatibility with, a specific saved person.',
+        'Compatibility (synastry) between YOU and a person from the <people> list — someone the ' +
+        'user saved, or a friend they are connected to in the app. Returns an overall score ' +
+        '(0-100), a band label, per-domain scores (romantic, emotional, communication, values, ' +
+        'long-term), and the strongest harmonious and frictional cross-chart contacts. Use this ' +
+        'for ANY question about how you get along with, or your compatibility with, one of them.',
       input_schema: {
         type: 'object',
-        properties: { person: { type: 'string', description: "The saved person's name." } },
+        properties: {
+          person: { type: 'string', description: "The person's name, as listed in <people>." },
+        },
         required: ['person'],
       },
     },
     {
       name: 'get_person_placement',
       description:
-        "A saved person's exact placement for a body (Sun, Moon, Mercury, Venus, Mars, …), by " +
-        'their name. Use to ground claims about their chart.',
+        'The exact placement of a body (Sun, Moon, Mercury, Venus, Mars, …) in the chart of a ' +
+        'person from the <people> list, by their name. Use to ground claims about their chart.',
       input_schema: {
         type: 'object',
         properties: {
-          person: { type: 'string', description: "The saved person's name." },
+          person: { type: 'string', description: "The person's name, as listed in <people>." },
           body: { type: 'string', description: 'Body name, e.g. "Venus".' },
         },
         required: ['person', 'body'],
@@ -536,6 +604,12 @@ export const REPORT_VOICE: string = [
   '  possibly".',
   '- Cut any sentence that would read the same for a different chart. If a line is',
   '  not tied to a real placement here, delete it.',
+  '- Do NOT use em dashes. Use a comma, a full stop, or a semicolon.',
+  '- Do NOT use the antithesis construction: "it is not X, it is Y", "this is not',
+  '  about X, it is about Y", "you are not X, you are Y". State the thing once,',
+  '  affirmatively.',
+  '- At most ONE figurative image per answer, and only where a literal sentence',
+  '  would be vaguer. Stacked metaphors read as filler.',
   '</voice>',
 ].join('\n');
 
@@ -742,33 +816,65 @@ function relationshipPhrase(relationship: string): string {
       return 'family';
     case 'friend':
       return 'a friend';
+    case 'connection':
+      return 'a friend connected to them in the app';
     default:
       return 'someone in your life';
   }
 }
 
-/** A short, factual block describing the people the user has saved. */
-function peopleBlock(people: RelationshipContext[]): string[] {
+/**
+ * Said out loud when the friend list could not be read this turn. Silence here
+ * would be a lie by omission: the model would answer "you have not added them"
+ * about a friend the user demonstrably has.
+ */
+const FRIENDS_UNREADABLE: string[] = [
+  'The list of friends the user is CONNECTED to could not be read this turn, so it',
+  'may be incomplete. If they ask about someone who is not listed, say you cannot',
+  'see their connections right now and ask who that person is to them. NEVER tell',
+  'them they have not added that person.',
+];
+
+/**
+ * A short, factual block describing the people in the user's life: the ones they
+ * saved themselves, and the friends they are connected to in the app (whose
+ * charts the app reads through that accepted connection).
+ */
+function peopleBlock(people: RelationshipContext[], friendsUnreadable = false): string[] {
   if (people.length === 0) {
+    // With the connection read failed, "they have saved nobody" is not a fact we
+    // hold, so the empty-list instruction must not assert it.
+    if (friendsUnreadable) {
+      return [
+        "PEOPLE: you have NO list of the people in this user's life this turn,",
+        'because the read failed. Never invent one: do not name a partner, ex or',
+        'friend, and do NOT tell them they have saved nobody. If they ask about a',
+        'specific person, say you cannot see their people right now and ask who that',
+        'person is to them.',
+      ];
+    }
     return [
       'PEOPLE: the user has not saved anyone else (no partner, crush, ex, friend or',
-      'family on record). Do NOT assume they have a relationship, if they ask about',
-      "love or a specific person, answer from their chart's capacity for it, and you",
-      'may gently note they can add someone to get a synastry reading.',
+      'family on record) and is not connected to anyone in the app.',
+      'Do NOT assume they have a relationship, if they ask about love or a specific',
+      "person, answer from their chart's capacity for it, and you may gently note they",
+      'can add someone, or connect with a friend, to get a synastry reading.',
     ];
   }
   return [
-    'PEOPLE IN THEIR LIFE (saved by the user, real; never invent others). The',
-    'placements listed for each person are FACTUAL ground truth from their computed',
-    'chart, you MAY use them directly when asked about that person, and you must NOT',
-    'invent placements for anyone not listed. For any question about how they relate',
-    'to / their compatibility with one of these, CALL `get_compatibility(person)` for',
-    'the score + key contacts; use `get_person_placement` for any body not already',
-    'listed below. NEVER guess a compatibility score:',
+    'PEOPLE IN THEIR LIFE (real: saved by the user, or connected to them in the app;',
+    'never invent others). The placements listed for each person are FACTUAL ground',
+    'truth from their computed chart, you MAY use them directly when asked about that',
+    'person, and you must NOT invent placements for anyone not listed. For any question',
+    'about how they relate to / their compatibility with one of these, CALL',
+    '`get_compatibility(person)` for the score + key contacts; use',
+    '`get_person_placement` for any body not already listed below. NEVER guess a',
+    'compatibility score:',
     ...people.map((p) => {
       const head = `- ${p.name}, ${relationshipPhrase(p.relationship)}, `;
       return head + (p.placements?.trim() ? p.placements.trim() : 'chart not computed yet');
     }),
+    ...(friendsUnreadable ? ['', ...FRIENDS_UNREADABLE] : []),
   ];
 }
 
@@ -813,8 +919,15 @@ export const CHAT_RULES: string = [
   '- NAME the placement behind any claim (body, sign, degree, house) in',
   '  parentheses after the claim. Nothing that would read the same for a',
   '  different chart.',
+  '- Do NOT use em dashes. Use a comma, a full stop, or a semicolon.',
+  '- Do NOT use the antithesis construction: "it is not X, it is Y", "this is not',
+  '  about X, it is about Y", "you are not X, you are Y". State the thing once,',
+  '  affirmatively.',
+  '- At most ONE figurative image per answer, and only where a literal sentence',
+  '  would be vaguer. Stacked metaphors read as filler.',
   '- The <people> list is factual context about their relationships, treat it',
-  '  as ground truth too: never invent a partner/ex they have not saved.',
+  '  as ground truth too: never invent a partner, ex or friend they do not have,',
+  '  and never assume someone is absent from their life because a read failed.',
   '- For a compatibility/relationship question about a saved person, CALL',
   '  `get_compatibility(person)` and ground your answer in its score, bands and',
   '  the named harmonious/frictional contacts it returns, explain WHY, never',
@@ -825,6 +938,17 @@ export const CHAT_RULES: string = [
   '  degree, or aspect.',
   '</chat_rules>',
 ].join('\n');
+
+/** Caveats about the people context that the prompt must state rather than hide. */
+export interface ChatContextOptions {
+  /**
+   * True when the user's CONNECTED friends could not be read this turn (see
+   * `loadConnectionPeople`). The prompt then says the list may be incomplete
+   * instead of letting the model answer "you have not added them" about a
+   * friend the user actually has.
+   */
+  friendsUnreadable?: boolean;
+}
 
 /**
  * Grounded, chat-flavoured system prompt for the conversational astrologer.
@@ -839,6 +963,7 @@ export function chatSystemPrompt(
   people: RelationshipContext[] = [],
   selfBirth: BirthData | null = null,
   contextSections = '',
+  opts: ChatContextOptions = {},
 ): string {
   const truth = chart2txt(chart, { label: label ?? 'You' });
   const directedBlock = directedProfectionChatBlock(chart, selfBirth);
@@ -860,7 +985,7 @@ export function chatSystemPrompt(
     '</tone_safety>',
     '',
     '<people>',
-    ...peopleBlock(people),
+    ...peopleBlock(people, opts.friendsUnreadable === true),
     '</people>',
     ...(directedBlock.length
       ? ['', '<precise_timing>', ...directedBlock, '</precise_timing>']
@@ -893,11 +1018,15 @@ export async function interpretChat(
    * validation below is unchanged.
    */
   contextSections = '',
+  /** Caveats about the people context (see {@link ChatContextOptions}). */
+  opts: ChatContextOptions = {},
 ): Promise<InterpretationResult> {
-  const system = chatSystemPrompt(chart, label, relationships, selfBirth, contextSections);
+  const system = chatSystemPrompt(chart, label, relationships, selfBirth, contextSections, opts);
   const toolSpecs = [...factToolSpecs([chart]), ...relationshipToolSpecs(relationships)];
   const toolsByChart = [new ChartFactTools(chart)];
-  const relTools = new RelationshipTools(selfBirth, relationships);
+  // The user's own chart is needed for synastry with a CONNECTED friend, whose
+  // birth data we deliberately never hold.
+  const relTools = new RelationshipTools(selfBirth, chart, relationships);
 
   const messages: ProviderMessage[] = [
     ...history.map((h) => ({ role: h.role, content: h.content }) satisfies ProviderMessage),

@@ -300,12 +300,27 @@ export type SearchRequest = z.infer<typeof searchRequestSchema>;
 /**
  * AI report request (TASK A8). The chart(s) are loaded server-side from the
  * caller's account; the body only selects the kind and, optionally, a specific
- * primary `chartId` and a second `partnerChartId` (compatibility, ties into A9).
+ * primary `chartId` and a second person for a compatibility reading.
+ *
+ * The second person can be named TWO ways, because the app now lets the user
+ * pick either from their own saved profiles or from their accepted friends:
+ *
+ *   * `partnerChartId` — a `charts.id` the CALLER owns (a saved profile).
+ *   * `partnerConnectionId` — a `connections.id` the caller is a party to. The
+ *     chart belongs to somebody else, so it is resolved through the same
+ *     consent gate the app's `get_connection_chart` RPC enforces (accepted
+ *     connection, caller is a party, neither side has blocked the other) and
+ *     only ever yields the counterparty's COMPUTED chart — never their raw
+ *     birth date, time or place.
+ *
+ * Supplying both is a client bug, not a security hole (each is independently
+ * authorised); the connection wins so the behaviour is at least deterministic.
  */
 export const reportRequestSchema = z.object({
   kind: z.enum(['natal', 'annual', 'compatibility']),
   chartId: z.string().uuid().optional(),
   partnerChartId: z.string().uuid().optional(),
+  partnerConnectionId: z.string().uuid().optional(),
   labels: z.array(z.string()).optional(),
   /**
    * Annual reports only: the calendar year to forecast (past or future — the

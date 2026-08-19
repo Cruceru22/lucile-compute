@@ -257,6 +257,293 @@ export async function loadSelfChart(user: AuthedUser): Promise<NatalChart | null
   return loadChartByBirthDataId(user, self.id);
 }
 
+/** The `connections` columns the consent gate decides on. */
+export interface ConnectionPartyRow {
+  requester_id: string;
+  addressee_id: string | null;
+  status: string;
+}
+
+/**
+ * The other party to a connection the caller may read, or null.
+ *
+ * Split out of {@link loadConnectionChart} because this — not the SQL around
+ * it — is the security decision, and it is worth testing on its own: the rule
+ * is that the connection must be ACCEPTED, that the caller must be one of its
+ * two parties, and that the counterparty must actually exist (an invite that
+ * was never redeemed has no addressee, so there is nobody to read).
+ *
+ * Blocks are checked separately by the caller, because that answer lives in a
+ * different table.
+ */
+export function connectionCounterpartyId(
+  selfUserId: string,
+  row: ConnectionPartyRow | null,
+): string | null {
+  if (!row || row.status !== 'accepted') return null;
+  const isRequester = row.requester_id === selfUserId;
+  const isAddressee = row.addressee_id === selfUserId;
+  if (!isRequester && !isAddressee) return null;
+  const other = isRequester ? row.addressee_id : row.requester_id;
+  // A self-connection would let the gate hand back the caller's own chart as if
+  // it were somebody else's. It should not exist; it is refused if it does.
+  if (!other || other === selfUserId) return null;
+  return other;
+}
+
+/** A counterparty's computed chart, plus the name to print beside it. */
+export interface ConnectionChart {
+  chart: NatalChart;
+  /** The counterparty's public display name, or null when they have set none. */
+  displayName: string | null;
+}
+
+/**
+ * Load the COMPUTED chart of the other party to one of the caller's accepted
+ * connections — the server-side twin of the app's `get_connection_chart` RPC.
+ *
+ * Why a hand-rolled gate rather than calling that RPC: the RPC keys its checks
+ * on `auth.uid()`, and this service authenticates with the SERVICE-ROLE key
+ * (see {@link authenticate}) — `auth.uid()` is null here, so the RPC would
+ * return nothing. The service role also bypasses RLS, so the consent rules
+ * cannot be left to the database; they are enforced here, in one place, and
+ * mirror the RPC's exactly:
+ *
+ *   1. the connection exists and is ACCEPTED,
+ *   2. `selfUserId` is one of its two parties,
+ *   3. neither party has blocked the other (a block revokes chart access
+ *      immediately, whatever the connection row still says),
+ *   4. only the counterparty's canonical SELF record is read, and only its
+ *      COMPUTED chart — never `birth_data`'s date, time or place, which this
+ *      feature deliberately never shares.
+ *
+ * Returns null when the gate rejects OR when the counterparty simply has no
+ * computed chart yet — both are "we cannot read that person", and neither is an
+ * error the caller can fix by retrying. A real DB failure THROWS
+ * {@link StorageUnavailableError}, as everywhere else in this file.
+ */
+export async function loadConnectionChart(
+  selfUserId: string,
+  connectionId: string,
+): Promise<ConnectionChart | null> {
+  const client = serviceClient();
+  if (!client) throw new StorageUnavailableError('service client unavailable');
+
+  const { data: conn, error: connError } = await client
+    .from('connections')
+    .select('requester_id, addressee_id, status')
+    .eq('id', connectionId)
+    .maybeSingle<ConnectionPartyRow>();
+  if (connError) {
+    console.warn('[storage] loadConnectionChart(connection) failed:', connError.message);
+    throw new StorageUnavailableError(connError.message);
+  }
+  const otherUserId = connectionCounterpartyId(selfUserId, conn);
+  if (!otherUserId) return null;
+
+  const { data: blockData, error: blockError } = await client
+    .from('blocks')
+    .select('blocker_id')
+    .or(
+      `and(blocker_id.eq.${selfUserId},blocked_id.eq.${otherUserId}),` +
+        `and(blocker_id.eq.${otherUserId},blocked_id.eq.${selfUserId})`,
+    )
+    .limit(1);
+  if (blockError) {
+    console.warn('[storage] loadConnectionChart(blocks) failed:', blockError.message);
+    throw new StorageUnavailableError(blockError.message);
+  }
+  if ((blockData ?? []).length > 0) return null;
+
+  // The counterparty's canonical SELF birth row — `label='self'` alone, oldest
+  // first, exactly as loadBirthData resolves the caller's own.
+  const { data: birth, error: birthError } = await client
+    .from('birth_data')
+    .select('id')
+    .eq('user_id', otherUserId)
+    .eq('label', 'self')
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle<{ id: string }>();
+  if (birthError) {
+    console.warn('[storage] loadConnectionChart(birth) failed:', birthError.message);
+    throw new StorageUnavailableError(birthError.message);
+  }
+  if (!birth?.id) return null; // they never finished onboarding
+
+  const { data: chartRow, error: chartError } = await client
+    .from('charts')
+    .select('chart')
+    .eq('birth_data_id', birth.id)
+    .order('computed_at', { ascending: false })
+    .limit(1)
+    .maybeSingle<{ chart: NatalChart }>();
+  if (chartError) {
+    console.warn('[storage] loadConnectionChart(chart) failed:', chartError.message);
+    throw new StorageUnavailableError(chartError.message);
+  }
+  if (!chartRow?.chart) return null; // no chart computed for them yet
+
+  // The name is a nicety for the PDF's second label, so a failure to read it
+  // must not fail the report — fall back to null and let the caller name them.
+  const { data: profile } = await client
+    .from('user_profiles')
+    .select('display_name')
+    .eq('user_id', otherUserId)
+    .maybeSingle<{ display_name: string | null }>();
+  const displayName = profile?.display_name?.trim();
+
+  return { chart: chartRow.chart, displayName: displayName ? displayName : null };
+}
+
+/** A connected friend, as the chat's relationship context sees them. */
+export interface ConnectionPerson {
+  /** The counterparty's user id — used to de-duplicate, never shown. */
+  userId: string;
+  /** Their public display name, or null when they have set none. */
+  displayName: string | null;
+  /**
+   * Their COMPUTED chart. This is the ONLY thing an accepted connection shares:
+   * their birth date, time and place are not read here or anywhere else.
+   */
+  chart: NatalChart;
+}
+
+/** Connected friends, plus whether the read could be believed (see below). */
+export interface ConnectionPeopleResult {
+  people: ConnectionPerson[];
+  /**
+   * True when a read FAILED, so an empty `people` means "we could not look",
+   * NOT "they are connected to nobody". The chat prompt says exactly that
+   * instead of telling the user they have not added anyone.
+   */
+  unavailable: boolean;
+}
+
+/** Cap on friends injected into the chat's people context (bounds the prompt). */
+export const MAX_CONNECTION_PEOPLE = 20;
+
+/**
+ * Every accepted connection of the caller's, with the counterparty's COMPUTED
+ * chart — the batch twin of {@link loadConnectionChart}, for the chat's people
+ * context.
+ *
+ * The consent gate is the same one, applied to the whole set at once: accepted
+ * connections the caller is a party to, minus anyone blocked in either
+ * direction, resolved to the counterparty's canonical SELF record and only that
+ * record's computed chart. Longest-standing connections first, capped at
+ * {@link MAX_CONNECTION_PEOPLE}.
+ *
+ * BEST-EFFORT by contract, unlike the throwing loaders in this file: the friend
+ * list ENRICHES a conversation that works without it, so a `connections` outage
+ * (or an un-migrated DB) must not 503 the chat. Any failure returns
+ * `{ people: [], unavailable: true }` so the caller can tell the model it is
+ * blind to friends this turn rather than assert the user has none.
+ */
+export async function loadConnectionPeople(selfUserId: string): Promise<ConnectionPeopleResult> {
+  const client = serviceClient();
+  if (!client) return { people: [], unavailable: true };
+
+  try {
+    const { data: connData, error: connError } = await client
+      .from('connections')
+      .select('requester_id, addressee_id, status, created_at')
+      .eq('status', 'accepted')
+      .or(`requester_id.eq.${selfUserId},addressee_id.eq.${selfUserId}`)
+      .order('created_at', { ascending: true });
+    if (connError) throw new Error(connError.message);
+
+    // Longest-standing first. The status filter above is only a cheap prefilter:
+    // the gate itself is {@link connectionCounterpartyId}, the same one the
+    // single-chart path applies, so both paths accept exactly the same rows.
+    const otherIds: string[] = [];
+    for (const row of (connData ?? []) as ConnectionPartyRow[]) {
+      const other = connectionCounterpartyId(selfUserId, row);
+      if (!other || otherIds.includes(other)) continue;
+      otherIds.push(other);
+    }
+    if (otherIds.length === 0) return { people: [], unavailable: false };
+
+    // A block revokes chart access immediately, in either direction, whatever
+    // the connection row still says.
+    const { data: blockData, error: blockError } = await client
+      .from('blocks')
+      .select('blocker_id, blocked_id')
+      .or(`blocker_id.eq.${selfUserId},blocked_id.eq.${selfUserId}`);
+    if (blockError) throw new Error(blockError.message);
+    const blocked = new Set<string>();
+    for (const row of (blockData ?? []) as Array<{ blocker_id: string; blocked_id: string }>) {
+      blocked.add(row.blocker_id === selfUserId ? row.blocked_id : row.blocker_id);
+    }
+    const visible = otherIds.filter((id) => !blocked.has(id)).slice(0, MAX_CONNECTION_PEOPLE);
+    if (visible.length === 0) return { people: [], unavailable: false };
+
+    // Each counterparty's canonical SELF birth row — `label='self'` alone,
+    // oldest first, exactly as loadBirthData resolves the caller's own. Only
+    // the row's ID travels: no birth column is selected.
+    const { data: birthData, error: birthError } = await client
+      .from('birth_data')
+      .select('id, user_id')
+      .in('user_id', visible)
+      .eq('label', 'self')
+      .order('created_at', { ascending: true });
+    if (birthError) throw new Error(birthError.message);
+    const userByBirthId = new Map<string, string>();
+    const seenUsers = new Set<string>();
+    for (const row of (birthData ?? []) as Array<{ id: string; user_id: string }>) {
+      if (seenUsers.has(row.user_id)) continue; // oldest self row wins
+      seenUsers.add(row.user_id);
+      userByBirthId.set(row.id, row.user_id);
+    }
+    if (userByBirthId.size === 0) return { people: [], unavailable: false };
+
+    const { data: chartRows, error: chartError } = await client
+      .from('charts')
+      .select('birth_data_id, chart')
+      .in('birth_data_id', [...userByBirthId.keys()])
+      .order('computed_at', { ascending: false });
+    if (chartError) throw new Error(chartError.message);
+    const chartByUser = new Map<string, NatalChart>();
+    for (const row of (chartRows ?? []) as Array<{
+      birth_data_id: string | null;
+      chart: NatalChart | null;
+    }>) {
+      const userId = row.birth_data_id ? userByBirthId.get(row.birth_data_id) : undefined;
+      if (!userId || !row.chart || chartByUser.has(userId)) continue; // newest wins
+      chartByUser.set(userId, row.chart);
+    }
+
+    // Names are a nicety: a failed read leaves them null and the caller falls
+    // back to a generic label, exactly as loadConnectionChart does.
+    const { data: profiles } = await client
+      .from('user_profiles')
+      .select('user_id, display_name')
+      .in('user_id', visible);
+    const nameByUser = new Map<string, string>();
+    for (const row of (profiles ?? []) as Array<{
+      user_id: string;
+      display_name: string | null;
+    }>) {
+      const name = row.display_name?.trim();
+      if (name) nameByUser.set(row.user_id, name);
+    }
+
+    const people: ConnectionPerson[] = [];
+    for (const userId of visible) {
+      const chart = chartByUser.get(userId);
+      if (!chart) continue; // they have not computed a chart yet
+      people.push({ userId, displayName: nameByUser.get(userId) ?? null, chart });
+    }
+    return { people, unavailable: false };
+  } catch (err) {
+    console.warn(
+      '[storage] loadConnectionPeople failed:',
+      err instanceof Error ? err.message : String(err),
+    );
+    return { people: [], unavailable: true };
+  }
+}
+
 /** The `birth_data` columns we read to reconstruct a {@link BirthData}. */
 interface BirthDataRow {
   id: string;
