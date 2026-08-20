@@ -1,7 +1,7 @@
 /**
  * TASK B6 — pro-depth techniques tests: harmonic math, midpoint wrap, antiscia
- * formulas on hand-computable values, and the fixed-stars graceful-unavailable
- * path under the default Moshier backend (no `sefstars.txt`).
+ * formulas on hand-computable values, and the fixed-stars contract in BOTH
+ * states — catalogue installed and catalogue absent.
  *
  * The pure-math tests are exact (the transforms are deterministic). The
  * chart-level tests use a known modern birth and assert structure + honest
@@ -159,20 +159,54 @@ describe('antiscia — reflection formulas on hand-computable values', () => {
 
 /* --------------------------- Fixed stars --------------------------------- */
 
-describe('fixed stars — graceful unavailability without sefstars.txt', () => {
-  it('fixedStarLongitude returns null when the catalogue is absent (Moshier default)', () => {
+/**
+ * These assertions are DELIBERATELY environment-aware. `sefstars.txt` is fetched
+ * by `scripts/fetch-ephemeris.sh` into a gitignored `ephe/`, so CI runs without
+ * it and a configured dev box (or the deployed service) runs with it. Pinning
+ * only one branch would mean the suite fails on exactly the machines where the
+ * feature actually works. Both branches are real contracts, so both are pinned.
+ *
+ * Regulus is the probe: it is NOT in the tiny star table the `sweph` package
+ * bundles, so a finite longitude for it means the real catalogue is installed.
+ */
+const CATALOGUE_INSTALLED = fixedStarLongitude('Regulus', 2451545.0) !== null;
+
+describe('fixed stars', () => {
+  it('fixedStarLongitude: null without the catalogue, the true position with it', () => {
     // J2000 noon JD.
     const lon = fixedStarLongitude('Regulus', 2451545.0);
-    expect(lon).toBeNull();
+    if (!CATALOGUE_INSTALLED) {
+      expect(lon).toBeNull();
+      return;
+    }
+    // Regulus at J2000 sits at 29°50' Leo — the published value, so this pins
+    // the actual astronomy and not merely "some number came back".
+    expect(lon).toBeCloseTo(149.829, 2);
   });
 
-  it('computeFixedStars degrades to available:false with a reason + empty contacts', () => {
+  it('computeFixedStars: honest unavailability, or real contacts when installed', () => {
     const r = computeFixedStars(BIRTH, { ascendant: 24.3, midheaven: 270 });
     expect(r.technique).toBe('fixed_stars');
-    expect(r.available).toBe(false);
-    expect(r.reason).toMatch(/sefstars\.txt/i);
-    expect(r.contacts).toEqual([]);
-    // The curated catalogue + meanings are STILL returned for the UI.
+
+    if (!CATALOGUE_INSTALLED) {
+      expect(r.available).toBe(false);
+      expect(r.reason).toMatch(/sefstars\.txt/i);
+      expect(r.contacts).toEqual([]);
+    } else {
+      expect(r.available).toBe(true);
+      expect(r.reason).toBeUndefined();
+      // Never a fabricated 0°: every contact carries a real star position, a
+      // catalogued star name, and an orb inside the configured limit.
+      for (const c of r.contacts) {
+        expect(Number.isFinite(c.starLongitude)).toBe(true);
+        expect(c.starLongitude).toBeGreaterThanOrEqual(0);
+        expect(c.starLongitude).toBeLessThan(360);
+        expect(r.catalog.some((s) => s.name === c.star)).toBe(true);
+        expect(Math.abs(c.orb)).toBeLessThanOrEqual(r.contactOrb);
+      }
+    }
+
+    // The curated catalogue + meanings are returned for the UI EITHER WAY.
     expect(r.catalog.length).toBeGreaterThanOrEqual(8);
     expect(r.catalog.find((s) => s.name === 'Regulus')?.meaning).toBeTruthy();
   });

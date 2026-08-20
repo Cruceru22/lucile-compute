@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 #
-# Download the Swiss Ephemeris `.se1` files this service needs into ./ephe.
+# Download the Swiss Ephemeris data files this service needs into ./ephe.
 #
-# Without them the service runs on the built-in Moshier ephemeris, which cannot
-# place Chiron or the four major asteroids (they come back in
-# `unavailableBodies`) and is lower precision than Swiss. The README calls the
-# `.se1` files the production configuration.
+# Without the `.se1` files the service runs on the built-in Moshier ephemeris,
+# which cannot place Chiron or the four major asteroids (they come back in
+# `unavailableBodies`) and is lower precision than Swiss. Without `sefstars.txt`
+# the fixed-star technique on /advanced degrades to `available:false` — sweph
+# ships a tiny built-in star table, so a partial catalogue is worse than none
+# and `computeFixedStars` deliberately refuses it. The README calls these files
+# the production configuration.
 #
 # SOURCE: Astrodienst's own public repository. Their old FTP path
 # (astro.com/ftp/swisseph/ephe) was retired in September 2023 and now just
@@ -31,10 +34,16 @@ DEST="$(cd "$(dirname "$0")/.." && pwd)/ephe"
 # Planets, Moon, and the asteroid file (Chiron + Ceres/Pallas/Juno/Vesta live
 # in `seas_*`). All three prefixes are needed; `seas_` is the one whose absence
 # silently costs you Chiron.
+#
+# `sefstars.txt` is the fixed-star catalogue: a small text file (~140KB), not an
+# .se1 block, and the only thing `swe_fixstar2_ut` reads. Its absence is what
+# makes the Advanced screen's fixed-star technique report "catalogue not
+# installed".
 FILES=(
   sepl_18.se1 sepl_24.se1
   semo_18.se1 semo_24.se1
   seas_18.se1 seas_24.se1
+  sefstars.txt
 )
 
 mkdir -p "$DEST"

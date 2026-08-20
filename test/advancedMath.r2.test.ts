@@ -1,12 +1,12 @@
 /**
  * ROADMAP-V2 QA PASS — strengthened harmonics / midpoints / antiscia maths and
- * the fixed-stars graceful-unavailable path (TASK B6).
+ * the fixed-stars contract in both catalogue states (TASK B6).
  *
  * Complements `advanced.test.ts` with additional WORKED, exact cases that
  * exercise the wrap behaviour of each transform, plus a midpoint case driven by
  * hand-picked longitudes (so the midpoint number is independently checkable),
- * and re-pins the fixed-star contract (available:false + NO fabricated
- * positions) on a second birth so it isn't an accident of one fixture.
+ * and re-pins the fixed-star contract (NO fabricated positions,
+ * never a partial catalogue) on a second birth so it isn't an accident of one fixture.
  *
  * Every assertion here is EXACT (the transforms are closed-form integer/degree
  * arithmetic). No external ephemeris reference is claimed.
@@ -88,7 +88,11 @@ describe('midpoint wrap — shared shorter-arc convention', () => {
 
 /* --------------------------- Fixed stars (graceful) ---------------------- */
 
-describe('fixed stars — graceful unavailability, second fixture', () => {
+// See the note in advanced.test.ts: `sefstars.txt` is fetched, not committed,
+// so both the installed and absent states are real and both get pinned here.
+const CATALOGUE_INSTALLED = fixedStarLongitude('Regulus', 2451545.0) !== null;
+
+describe('fixed stars — second fixture', () => {
   const BIRTH: BirthData = {
     date: '1975-09-09',
     time: '03:45',
@@ -99,11 +103,15 @@ describe('fixed stars — graceful unavailability, second fixture', () => {
     houseSystem: 'placidus',
   };
 
-  it('stars NOT in sweph’s bundled mini-table resolve to null without sefstars.txt', () => {
-    // `swe_fixstar2_ut` returns flag<0 for these (Regulus/Algol are not in the
-    // tiny built-in table the sweph package ships), so the primitive is null.
+  it('stars outside sweph’s bundled mini-table track the catalogue’s presence', () => {
+    // `swe_fixstar2_ut` returns flag<0 for these when `sefstars.txt` is absent
+    // (Regulus/Algol/Aldebaran are not in the tiny built-in table the sweph
+    // package ships), so the primitive is null — and a finite longitude once
+    // the real catalogue is installed.
     for (const star of ['Regulus', 'Algol', 'Aldebaran']) {
-      expect(fixedStarLongitude(star, 2442664.6562)).toBeNull();
+      const lon = fixedStarLongitude(star, 2442664.6562);
+      if (!CATALOGUE_INSTALLED) expect(lon).toBeNull();
+      else expect(Number.isFinite(lon as number)).toBe(true);
     }
   });
 
@@ -117,13 +125,21 @@ describe('fixed stars — graceful unavailability, second fixture', () => {
     expect(spica).not.toBeNull();
   });
 
-  it('computeFixedStars is available:false, empty contacts, catalogue still present', () => {
+  it('computeFixedStars never fabricates a position in either state', () => {
     const r = computeFixedStars(BIRTH, { ascendant: 120.5, midheaven: 30.2 });
-    expect(r.available).toBe(false);
-    expect(r.reason).toMatch(/sefstars\.txt/i);
-    expect(r.contacts).toEqual([]);
-    // No contact can claim a position when the catalogue is missing.
-    expect(r.contacts.length).toBe(0);
+    if (!CATALOGUE_INSTALLED) {
+      expect(r.available).toBe(false);
+      expect(r.reason).toMatch(/sefstars\.txt/i);
+      // No contact can claim a position when the catalogue is missing.
+      expect(r.contacts).toEqual([]);
+    } else {
+      expect(r.available).toBe(true);
+      // An "available" result must be the WHOLE curated catalogue, never the
+      // Spica-only partial the bundled mini-table would otherwise produce.
+      for (const s of r.catalog) {
+        expect(fixedStarLongitude(s.name, 2442664.6562)).not.toBeNull();
+      }
+    }
     // The curated catalogue + meanings are always returned for the UI.
     expect(r.catalog.length).toBeGreaterThanOrEqual(8);
     for (const s of r.catalog) {

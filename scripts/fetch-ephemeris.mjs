@@ -1,15 +1,20 @@
 #!/usr/bin/env node
 /**
- * Download the Swiss Ephemeris `.se1` files into ./ephe.
+ * Download the Swiss Ephemeris data files into ./ephe.
  *
  * Node rather than bash+curl because this also runs during the Vercel build,
  * and a build image is not guaranteed to have `curl` — Node is the one thing
  * that is certainly present.
  *
- * Without these files the service falls back to the built-in Moshier
+ * Without the `.se1` files the service falls back to the built-in Moshier
  * ephemeris, which cannot place Chiron or the four major asteroids (they come
  * back in `unavailableBodies`) and is lower precision. `/health` reports which
  * backend is live, so a deploy that silently lost them is visible immediately.
+ *
+ * Without `sefstars.txt` the fixed-star technique on /advanced degrades to
+ * `available:false` — and that one is NOT visible in `/health`, so a deploy
+ * that loses it shows up only as the Advanced screen's "catalogue not
+ * installed" card. This is the file whose absence made fixed stars look broken.
  *
  * SOURCE: Astrodienst's own public repository. Their old FTP path
  * (astro.com/ftp/swisseph/ephe) was retired in September 2023 and now only
@@ -31,7 +36,11 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const BASE = 'https://raw.githubusercontent.com/aloistr/swisseph/master/ephe';
-// `seas_*` is the one whose absence silently costs you Chiron.
+// `seas_*` is the one whose absence silently costs you Chiron. `sefstars.txt`
+// is the fixed-star catalogue — a ~140KB text file, not an .se1 block, and the
+// only thing `swe_fixstar2_ut` reads. `computeFixedStars` probes the WHOLE
+// curated list and refuses a partial result, so missing this file means the
+// technique reports "catalogue not installed" rather than a Spica-only answer.
 const FILES = [
   'sepl_18.se1',
   'sepl_24.se1',
@@ -39,6 +48,7 @@ const FILES = [
   'semo_24.se1',
   'seas_18.se1',
   'seas_24.se1',
+  'sefstars.txt',
 ];
 
 const dest = join(dirname(fileURLToPath(import.meta.url)), '..', 'ephe');
