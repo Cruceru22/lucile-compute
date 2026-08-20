@@ -153,6 +153,15 @@ export interface MidpointContact {
 
 export interface MidpointsResult {
   technique: 'midpoints';
+  /**
+   * The natal positions every midpoint was derived from.
+   *
+   * Returned so a client can DRAW the technique — a midpoint only means
+   * anything next to the two bodies it sits between — without a second
+   * `/natal` round-trip, and without re-deriving longitudes from the pair
+   * list (which is ambiguous by 180° per pair).
+   */
+  positions: PlacedPoint[];
   /** Every unordered planet PAIR's midpoint, in canonical order. */
   pairs: MidpointPair[];
   /** Planets sitting on a midpoint (or its opposite) within `orb`. */
@@ -217,6 +226,7 @@ export function computeMidpoints(birth: BirthData, orb = DEFAULT_MIDPOINT_ORB): 
 
   return {
     technique: 'midpoints',
+    positions: positions.map((p) => place(p.name, p.absoluteDegree)),
     pairs,
     contacts,
     contactOrb: orb,
@@ -405,10 +415,30 @@ export const MAJOR_FIXED_STARS: ReadonlyArray<{
 /** Default conjunction orb for fixed stars — very tight, as is traditional. */
 export const DEFAULT_FIXED_STAR_ORB = 1.0;
 
+/** A point on the wheel a star can be conjunct: a body, or a chart angle. */
+export type FixedStarPointName = PlanetName | 'Ascendant' | 'Midheaven';
+
+/** One curated star's actual position at the chart moment. */
+export interface FixedStarPosition {
+  name: string;
+  /** Ecliptic longitude in [0, 360). */
+  absoluteDegree: number;
+  sign: ZodiacSign;
+  degree: number;
+}
+
+/** A natal point the stars were tested against, placed for rendering. */
+export interface FixedStarNatalPoint {
+  name: FixedStarPointName;
+  absoluteDegree: number;
+  sign: ZodiacSign;
+  degree: number;
+}
+
 /** A natal body found conjunct a fixed star within orb. */
 export interface FixedStarContact {
   /** The natal body (planet or angle) making the conjunction. */
-  body: PlanetName | 'Ascendant' | 'Midheaven';
+  body: FixedStarPointName;
   star: string;
   /** The star's ecliptic longitude at the chart moment, in [0, 360). */
   starLongitude: number;
@@ -432,6 +462,17 @@ export interface FixedStarsResult {
   contacts: FixedStarContact[];
   /** The curated catalogue of stars + meanings, always returned for the UI. */
   catalog: ReadonlyArray<{ name: string; meaning: string }>;
+  /**
+   * Where each curated star actually IS at the chart moment.
+   *
+   * Present ONLY when `available` — the whole point of the unavailable branch is
+   * that we have no positions, and an empty array would read as "no stars"
+   * rather than "no catalogue". A client draws the conjunctions from this plus
+   * `positions`; a contact alone cannot show WHY it is a contact.
+   */
+  starPositions?: FixedStarPosition[];
+  /** The natal points the stars were tested against (bodies + known angles). */
+  positions: FixedStarNatalPoint[];
   contactOrb: number;
   ephemerisBackend: EphemerisBackend;
 }
@@ -475,6 +516,24 @@ export function computeFixedStars(
   const { positions, jdUt } = bodiesFor(birth);
   const backend = getBackend();
 
+  // The list of "natal points" to test against each star: every body + (when
+  // available) the Ascendant and Midheaven. Built BEFORE the catalogue probe so
+  // the unavailable branch can return them too — the natal chart is real
+  // whether or not the star catalogue is installed, and a client that draws the
+  // technique should still be able to show the wheel it would go on.
+  const points: Array<{ name: FixedStarPointName; lon: number }> = positions.map((p) => ({
+    name: p.name,
+    lon: p.absoluteDegree,
+  }));
+  if (angles?.ascendant != null) points.push({ name: 'Ascendant', lon: angles.ascendant });
+  if (angles?.midheaven != null) points.push({ name: 'Midheaven', lon: angles.midheaven });
+  const natalPoints: FixedStarNatalPoint[] = points.map((p) => ({
+    name: p.name,
+    absoluteDegree: norm360(p.lon),
+    sign: signFor(p.lon),
+    degree: degreeInSign(p.lon),
+  }));
+
   // Probe the WHOLE catalogue, not a single star. The `sweph` package ships a
   // tiny BUILT-IN fixed-star table (only a couple of entries, e.g. Spica) that
   // `swe_fixstar2_ut` resolves even when `sefstars.txt` is absent. A single-star
@@ -494,24 +553,26 @@ export function computeFixedStars(
         'Fixed-star catalogue (sefstars.txt) is not installed. Add it to SWEPH_PATH/EPHE_PATH to enable fixed-star conjunctions.',
       contacts: [],
       catalog: MAJOR_FIXED_STARS,
+      positions: natalPoints,
       contactOrb: orb,
       ephemerisBackend: backend,
     };
   }
 
-  // The list of "natal points" to test against each star: every body + (when
-  // available) the Ascendant and Midheaven.
-  const points: Array<{ name: FixedStarContact['body']; lon: number }> = positions.map((p) => ({
-    name: p.name,
-    lon: p.absoluteDegree,
-  }));
-  if (angles?.ascendant != null) points.push({ name: 'Ascendant', lon: angles.ascendant });
-  if (angles?.midheaven != null) points.push({ name: 'Midheaven', lon: angles.midheaven });
-
+  // Every probe resolved (checked above), so each star has a real position and
+  // the whole curated catalogue can be placed on the wheel — not only the ones
+  // that happen to be conjunct something.
+  const starPositions: FixedStarPosition[] = [];
   const contacts: FixedStarContact[] = [];
-  for (const star of MAJOR_FIXED_STARS) {
-    const lon = fixedStarLongitude(star.name, jdUt);
-    if (lon === null) continue; // a single star missing from the catalogue
+  for (const [i, star] of MAJOR_FIXED_STARS.entries()) {
+    const lon = probes[i] ?? null;
+    if (lon === null) continue; // unreachable here; kept so the loop is total
+    starPositions.push({
+      name: star.name,
+      absoluteDegree: lon,
+      sign: signFor(lon),
+      degree: degreeInSign(lon),
+    });
     for (const point of points) {
       const sep = angularSeparation(point.lon, lon);
       if (sep <= orb) {
@@ -533,6 +594,8 @@ export function computeFixedStars(
     available: true,
     contacts,
     catalog: MAJOR_FIXED_STARS,
+    starPositions,
+    positions: natalPoints,
     contactOrb: orb,
     ephemerisBackend: backend,
   };
